@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "nonebot-plugin-skills"
+version = "0.1.0"
+description = "Gemini avatar/image and chat plugin with skills and context cache for NoneBot2"
+readme = "README.md"
+authors = ["yourname <you@example.com>"]
+packages = [{ include = "nonebot_plugin_skills" }]
+include = ["nonebot_plugin_skills/SKILLS.md"]
+
+[tool.poetry.dependencies]
+python = ">=3.9"
+nonebot2 = ">=2.2.0"
+nonebot-adapter-onebot = ">=2.2.0"
+httpx = ">=0.24.0"
+pydantic = ">=1.10"
+google-genai = ">=1.0.0"
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
