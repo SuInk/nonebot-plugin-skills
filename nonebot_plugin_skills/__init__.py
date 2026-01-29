@@ -5,7 +5,6 @@ import base64
 import json
 import re
 import time
-from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, cast
 
@@ -404,6 +403,10 @@ def _avatar_url(qq: str) -> str:
     return f"http://q.qlogo.cn/headimg_dl?dst_uin={qq}&spec=640"
 
 
+def _group_avatar_url(group_id: int) -> str:
+    return f"http://p.qlogo.cn/gh/{group_id}/{group_id}/640"
+
+
 WEATHER_CODE_MAP = {
     0: "晴",
     1: "大部晴朗",
@@ -541,33 +544,6 @@ def _normalize_weather_query(query: str) -> str:
     return cleaned or query
 
 
-def _format_temp_range(
-    min_value: Optional[float],
-    max_value: Optional[float],
-    unit: str,
-) -> str:
-    if min_value is None and max_value is None:
-        return f"未知{unit}"
-    if min_value is None:
-        return f"{_format_number(max_value)}{unit}"
-    if max_value is None:
-        return f"{_format_number(min_value)}{unit}"
-    return f"{_format_number(min_value)}~{_format_number(max_value)}{unit}"
-
-
-def _is_night_time(time_value: Optional[str]) -> bool:
-    if isinstance(time_value, str) and time_value:
-        try:
-            parsed = datetime.fromisoformat(time_value.replace("Z", "+00:00"))
-            hour = parsed.hour
-        except Exception:
-            hour = None
-        if hour is not None:
-            return hour >= 18 or hour < 6
-    now = time.localtime()
-    return now.tm_hour >= 18 or now.tm_hour < 6
-
-
 async def _build_weather_messages(query: str) -> List[str]:
     normalized_query = _normalize_weather_query(query)
     location = await _geocode_location(normalized_query)
@@ -576,14 +552,23 @@ async def _build_weather_messages(query: str) -> List[str]:
     name = location.get("name") or normalized_query
     admin1 = location.get("admin1")
     country = location.get("country")
-    display_parts: List[str] = []
-    if country:
-        display_parts.append(str(country))
-    if admin1 and admin1 not in display_parts:
-        display_parts.append(str(admin1))
-    if name and name not in display_parts:
-        display_parts.append(str(name))
-    display_name = " ".join(display_parts) if display_parts else str(name)
+    country_code = location.get("country_code")
+    is_domestic = str(country_code or "").upper() == "CN" or str(country or "") in {
+        "中国",
+        "中华人民共和国",
+        "China",
+    }
+    if is_domestic:
+        display_name = str(name)
+    else:
+        display_parts: List[str] = []
+        if country:
+            display_parts.append(str(country))
+        if admin1 and admin1 not in display_parts:
+            display_parts.append(str(admin1))
+        if name and name not in display_parts:
+            display_parts.append(str(name))
+        display_name = " ".join(display_parts) if display_parts else str(name)
     lat = float(location["latitude"])
     lon = float(location["longitude"])
     data = await _fetch_current_weather(lat, lon)
@@ -603,37 +588,10 @@ async def _build_weather_messages(query: str) -> List[str]:
     wind = _format_measure(wind_value, wind_unit)
     code_desc = _weather_code_desc(weather_code)
     advice = _weather_clothing_advice(temp_value, weather_code)
-    time_value = current.get("time")
-
-    line1 = "我看看啊"
     line2 = f"{display_name} 现在{temp} {code_desc} 湿度{humidity} 风{wind}"
     line3 = f"穿衣建议：{advice}"
 
-    if _is_night_time(time_value):
-        daily = await _fetch_daily_weather(lat, lon)
-        daily_data = daily.get("daily", {}) if isinstance(daily, dict) else {}
-        daily_units = daily.get("daily_units", {}) if isinstance(daily, dict) else {}
-        temps_max = daily_data.get("temperature_2m_max") or []
-        temps_min = daily_data.get("temperature_2m_min") or []
-        codes = daily_data.get("weather_code") or []
-        if len(temps_max) > 1 or len(temps_min) > 1 or len(codes) > 1:
-            max_value = temps_max[1] if len(temps_max) > 1 else None
-            min_value = temps_min[1] if len(temps_min) > 1 else None
-            code_value = codes[1] if len(codes) > 1 else None
-            unit = daily_units.get("temperature_2m_max") or temp_unit
-            tomorrow_desc = _weather_code_desc(code_value)
-            if min_value is not None and max_value is not None:
-                temp_for_advice = (float(min_value) + float(max_value)) / 2.0
-            else:
-                temp_for_advice = min_value if min_value is not None else max_value
-            tomorrow_advice = _weather_clothing_advice(temp_for_advice, code_value)
-            temp_range = _format_temp_range(min_value, max_value, unit)
-            line3 = (
-                f"{line3}；明天{tomorrow_desc} {temp_range}，"
-                f"穿衣建议：{tomorrow_advice}"
-            )
-
-    return [line1, line2, line3]
+    return [line2, line3]
 
 
 async def _geocode_location(query: str) -> Optional[dict]:
@@ -653,22 +611,6 @@ async def _fetch_current_weather(lat: float, lon: float) -> Optional[dict]:
         "latitude": lat,
         "longitude": lon,
         "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
-        "timezone": "auto",
-    }
-    async with httpx.AsyncClient(timeout=config.request_timeout) as client:
-        resp = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
-        resp.raise_for_status()
-        data = resp.json()
-    if not isinstance(data, dict):
-        return None
-    return data
-
-
-async def _fetch_daily_weather(lat: float, lon: float) -> Optional[dict]:
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "daily": "temperature_2m_max,temperature_2m_min,weather_code",
         "timezone": "auto",
     }
     async with httpx.AsyncClient(timeout=config.request_timeout) as client:
@@ -1141,7 +1083,7 @@ async def _resolve_image_url(
     at_user: Optional[str],
 ) -> Optional[str]:
     target = str(intent.get("target") or "").lower()
-    params = intent.get("params") if isinstance(intent.get("params"), dict) else {}
+    params = _intent_params(intent)
     user_id = str(event.get_user_id())
 
     if target == "message_image":
@@ -1154,6 +1096,10 @@ async def _resolve_image_url(
         return state.last_image_url
     if target == "sender_avatar":
         return _avatar_url(user_id)
+    if target == "group_avatar":
+        if isinstance(event, GroupMessageEvent):
+            return _group_avatar_url(int(event.group_id))
+        return None
     if target == "qq_avatar":
         qq = params.get("qq")
         if qq:
@@ -1293,18 +1239,34 @@ def _build_primary_intent_text(
     return f"{text}\n回复内容: {reply_text}"
 
 
-_ALLOWED_ACTIONS = {"chat", "image_chat", "image_generate", "image_create", "weather", "ignore"}
+_ALLOWED_ACTIONS = {
+    "chat",
+    "image_chat",
+    "image_generate",
+    "image_create",
+    "weather",
+    "avatar_get",
+    "ignore",
+}
 _ALLOWED_TARGETS = {
     "message_image",
     "reply_image",
     "at_user",
     "last_image",
     "sender_avatar",
+    "group_avatar",
     "qq_avatar",
     "message_id",
     "wait_next",
     "none",
 }
+
+
+def _intent_params(intent: Optional[dict]) -> dict[str, object]:
+    if not isinstance(intent, dict):
+        return {}
+    raw_params = intent.get("params")
+    return raw_params if isinstance(raw_params, dict) else {}
 
 
 def _normalize_intent(
@@ -1324,7 +1286,7 @@ def _normalize_intent(
     instruction = intent.get("instruction")
     if not isinstance(instruction, str) or not instruction.strip():
         return None
-    params = intent.get("params") if isinstance(intent.get("params"), dict) else {}
+    params = _intent_params(intent)
     target = str(intent.get("target", "")).strip().lower()
 
     if action == "image_create":
@@ -1356,9 +1318,21 @@ def _normalize_intent(
             "params": params,
         }
 
+    if action == "avatar_get":
+        if target not in _ALLOWED_TARGETS:
+            target = ""
+        if not target or target == "none":
+            target = "sender_avatar"
+        return {
+            "action": action,
+            "instruction": instruction.strip(),
+            "target": target,
+            "params": params,
+        }
+
     if action == "weather":
         city = ""
-        raw_city = params.get("city") if isinstance(params, dict) else None
+        raw_city = params.get("city")
         if isinstance(raw_city, str):
             city = raw_city.strip()
         if not city and isinstance(instruction, str):
@@ -1524,6 +1498,7 @@ async def _handle_natural_language(bot: Bot, event: MessageEvent):
         if not query:
             await nlp_handler.send("请告诉我城市或地区，例如：天气 北京")
             return
+        await nlp_handler.send("我看看喵")
         try:
             messages = await _build_weather_messages(query)
             if not messages:
@@ -1545,9 +1520,30 @@ async def _handle_natural_language(bot: Bot, event: MessageEvent):
             await nlp_handler.send(f"出错了：{_safe_error_message(exc)}")
         return
 
+    if action == "avatar_get":
+        target = str(intent.get("target") or "").lower()
+        params = _intent_params(intent)
+        if target == "qq_avatar" and not params.get("qq"):
+            await nlp_handler.send("请提供 QQ 号。")
+            return
+        image_url = await _resolve_image_url(
+            intent,
+            event=event,
+            state=state,
+            current_image_url=None,
+            reply_image_url=None,
+            at_user=at_user,
+        )
+        if not image_url:
+            await nlp_handler.send("未找到可用的头像。")
+            return
+        await nlp_handler.send(_image_segment_from_result(image_url))
+        _mark_handled_request(state, event, text)
+        return
+
     prompt = str(intent.get("instruction"))
     target = str(intent.get("target") or "").lower()
-    params = intent.get("params") if isinstance(intent.get("params"), dict) else {}
+    params = _intent_params(intent)
 
     if action == "image_create":
         await nlp_handler.send("正在生成图片，请稍候...")
@@ -1731,6 +1727,7 @@ async def handle_weather(bot: Bot, event: MessageEvent, args: Message = CommandA
         normalized = _normalize_intent(intent, False, False, None, state)
         if not normalized or not normalized.get("instruction"):
             await weather_handler.finish("请提供城市或地区，例如：天气 北京")
+        await weather_handler.send("我看看喵")
         messages = await _build_weather_messages(str(normalized.get("instruction")))
         if not messages:
             await weather_handler.finish("天气服务返回异常，请稍后再试。")
