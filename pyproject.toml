@@ -5,7 +5,6 @@ description = "Gemini avatar/image and chat plugin with skills and context cache
 readme = "README.md"
 authors = ["yourname <you@example.com>"]
 packages = [{ include = "nonebot_plugin_skills" }]
-include = ["nonebot_plugin_skills/SKILLS.md"]
 
 [tool.poetry.dependencies]
 python = ">=3.9"

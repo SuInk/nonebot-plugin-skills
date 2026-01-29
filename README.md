@@ -5,8 +5,8 @@
 ## 功能
 - 处理头像/图片：命令内带图、@某人头像、或使用最近聊天图片
 - 聊天对话：带上下文的自然语言聊天
+- 天气查询：输入城市/地区即可查询当前天气
 - 上下文缓存：按群/私聊隔离，定时过期
-- Skills：内置 `SKILLS.md`，可自行编辑
 
 ## 安装
 在 NoneBot2 项目中安装依赖：
@@ -37,6 +37,9 @@ GEMINI_LOG_RESPONSE=false
 IMAGE_TIMEOUT=120
 NLP_ENABLE=true
 BOT_KEYWORDS=["Diana","diana","嘉然"]
+NLP_CONTEXT_HISTORY_MESSAGES=2
+NLP_CONTEXT_FUTURE_MESSAGES=2
+NLP_CONTEXT_FUTURE_WAIT_SEC=1.0
 ```
 
 ## 使用
@@ -46,14 +49,13 @@ BOT_KEYWORDS=["Diana","diana","嘉然"]
 | 处理头像 <指令> | 处理头像/最近图片/@用户头像 |
 | 聊天 <内容> | 上下文聊天 |
 | 技能 <内容> | 上下文聊天 |
+| 天气 <城市> | 查询当前天气 |
 
 ### 示例
 - `Diana帮忙把@向晚头像变成黑白`
 - `处理头像 变成赛博朋克风`
 - `处理头像 @小明 变成油画风`
 - `聊天 你还记得刚才的头像吗？`
+- `天气 上海`
 
 > 若图片模型仅返回文本结果，插件会直接把文本回复出来（便于你确认模型是否支持图像输出）。
-
-## 自定义 Skills
-编辑 `nonebot_plugin_skills/SKILLS.md` 中的 `[chat]` 与 `[image]` 段落即可。
