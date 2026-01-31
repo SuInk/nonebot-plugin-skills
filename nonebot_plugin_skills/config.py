@@ -14,6 +14,7 @@ class Config(BaseModel):
     image_timeout: float = 120.0
     history_ttl_sec: int = 600
     history_max_messages: int = 10
+    forward_line_threshold: int = 8
     gemini_log_response: bool = False
     nlp_enable: bool = True
     bot_keywords: List[str] = []

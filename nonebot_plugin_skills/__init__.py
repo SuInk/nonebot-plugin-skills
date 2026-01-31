@@ -248,12 +248,75 @@ def _format_context_line(text: str, user_name: Optional[str]) -> str:
     return text
 
 
+def _model_user_name() -> str:
+    return "我"
+
+
 def _compact_reply_lines(text: str) -> str:
     if not text:
         return text
     lines = [line.strip() for line in text.split("\n")]
     lines = [line for line in lines if line]
     return "\n".join(lines).strip()
+
+
+def _forward_line_threshold() -> int:
+    try:
+        threshold = int(getattr(config, "forward_line_threshold", 0))
+    except Exception:
+        threshold = 0
+    if threshold <= 0:
+        return 8
+    return threshold
+
+
+def _bot_display_name(bot: Bot) -> str:
+    nick = getattr(bot, "config", None)
+    if nick is not None:
+        nickname = getattr(nick, "nickname", None)
+        if isinstance(nickname, (list, tuple)) and nickname:
+            return str(nickname[0])
+        if isinstance(nickname, str) and nickname.strip():
+            return nickname.strip()
+    return "嘉然"
+
+
+async def _send_text_response(
+    bot: Bot,
+    event: MessageEvent,
+    send_func,
+    text: str,
+) -> None:
+    if not text:
+        return
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    if len(lines) <= _forward_line_threshold():
+        await send_func(text)
+        return
+    nickname = _bot_display_name(bot)
+    self_id = _coerce_int(getattr(event, "self_id", None))
+    if self_id is None:
+        await send_func(text)
+        return
+    nodes = [
+        MessageSegment.node_custom(
+            user_id=self_id,
+            nickname=nickname,
+            content=line,
+        )
+        for line in lines
+    ]
+    try:
+        if isinstance(event, GroupMessageEvent):
+            await bot.send_group_forward_msg(group_id=event.group_id, messages=nodes)
+        else:
+            user_id = _coerce_int(event.get_user_id())
+            if user_id is None:
+                await send_func(text)
+                return
+            await bot.send_private_forward_msg(user_id=user_id, messages=nodes)
+    except Exception:
+        await send_func(text)
 
 
 def _transition_text(action: str) -> Optional[str]:
@@ -1120,6 +1183,8 @@ def _append_history(
     ts: Optional[float] = None,
     message_id: Optional[int] = None,
 ) -> None:
+    if role == "model" and not user_name:
+        user_name = _model_user_name()
     state.history.append(
         HistoryItem(
             role=role,
@@ -1657,6 +1722,7 @@ async def _build_travel_plan_reply(
 
 
 async def _dispatch_intent(
+    bot: Bot,
     intent: dict,
     state: SessionState,
     event: MessageEvent,
@@ -1687,7 +1753,7 @@ async def _dispatch_intent(
                 to_bot=True,
             )
             _append_history(state, "model", reply)
-            await send_func(reply)
+            await _send_text_response(bot, event, send_func, reply)
             _mark_handled_request(state, event, text)
         except Exception as exc:
             logger.error("NLP chat failed: {}", _safe_error_message(exc))
@@ -1732,7 +1798,7 @@ async def _dispatch_intent(
             reply = await _build_travel_plan_reply(intent, state, event)
             if not reply:
                 return
-            await send_func(reply)
+            await _send_text_response(bot, event, send_func, reply)
             _mark_handled_request(state, event, text)
         except Exception as exc:
             logger.error("NLP travel failed: {}", _safe_error_message(exc))
@@ -1837,7 +1903,7 @@ async def _dispatch_intent(
                 to_bot=True,
             )
             _append_history(state, "model", reply)
-            await send_func(reply)
+            await _send_text_response(bot, event, send_func, reply)
             _mark_handled_request(state, event, text)
         except UnsupportedImageError:
             await send_func("这个格式我处理不了，发张静态图吧。")
@@ -2090,6 +2156,7 @@ async def _handle_natural_language(bot: Bot, event: MessageEvent):
     if reply_id is not None and isinstance(intent.get("params"), dict):
         intent["params"].setdefault("message_id", reply_id)
     await _dispatch_intent(
+        bot,
         intent,
         state,
         event,
@@ -2102,6 +2169,7 @@ async def _handle_natural_language(bot: Bot, event: MessageEvent):
 
 
 async def _handle_command_via_intent(
+    bot: Bot,
     event: MessageEvent,
     *,
     text: str,
@@ -2134,6 +2202,7 @@ async def _handle_command_via_intent(
     if reply_id is not None and isinstance(intent.get("params"), dict):
         intent["params"].setdefault("message_id", reply_id)
     await _dispatch_intent(
+        bot,
         intent,
         state,
         event,
@@ -2151,6 +2220,7 @@ async def handle_avatar(bot: Bot, event: MessageEvent, args: Message = CommandAr
     if not prompt:
         await avatar_handler.finish("请告诉我你想怎么处理头像，例如：处理头像 变成赛博朋克风")
     await _handle_command_via_intent(
+        bot,
         event,
         text=f"处理头像 {prompt}",
         send_func=avatar_handler.send,
@@ -2163,6 +2233,7 @@ async def handle_chat(bot: Bot, event: MessageEvent, args: Message = CommandArg(
     if not prompt:
         await chat_handler.finish("请发送要聊天的内容，例如：聊天 你好")
     await _handle_command_via_intent(
+        bot,
         event,
         text=f"聊天 {prompt}",
         send_func=chat_handler.send,
@@ -2175,6 +2246,7 @@ async def handle_weather(bot: Bot, event: MessageEvent, args: Message = CommandA
     if not query:
         await weather_handler.finish("请提供城市或地区，例如：天气 北京")
     await _handle_command_via_intent(
+        bot,
         event,
         text=f"天气 {query}",
         send_func=weather_handler.send,
@@ -2187,6 +2259,7 @@ async def handle_travel(bot: Bot, event: MessageEvent, args: Message = CommandAr
     if not text:
         await travel_handler.finish("请提供行程需求，例如：旅行规划 3天2晚 北京")
     await _handle_command_via_intent(
+        bot,
         event,
         text=f"旅行规划 {text}",
         send_func=travel_handler.send,
