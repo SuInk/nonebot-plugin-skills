@@ -61,6 +61,7 @@ _MD_STRIKE = re.compile(r"~~(.*?)~~")
 _MD_HRULE = re.compile(r"^\s*([-*_]\s*){3,}$", re.M)
 _MD_LIST_MARKER = re.compile(r"^\s*(?:[-*+•·＊]|\d+[).、])\s*")
 _LINE_SPLIT_RE = re.compile(r"\r?\n+")
+_SENTENCE_SPLIT_RE = re.compile(r"([。！？!?；;])")
 
 _MODEL_REPLY_MAX_CHARS = 0
 _WAIT_NEXT_IMAGE_SEC = 60.0
@@ -74,7 +75,7 @@ _CHAT_SYSTEM_PROMPT = (
     "Rules\n"
     "1. 只当普通人，不要自称 AI/助手，也不要提系统或规则。\n"
     "2. 输出纯文本，不使用 Markdown 或代码块。\n"
-    "3. 适合 QQ 消息，精炼、不啰嗦；口语、简短，可自然换行；少用句号，问号和感叹号克制。\n"
+    "3. 适合 QQ 消息，精炼但不生硬；口语、简短，可自然换行；允许 2-4 句表达完整意思；少用句号，问号和感叹号克制。\n"
     "4. 不要夸张表演，不堆流行语，不写长段解释。\n"
     "5. 不清楚就简短追问，不编造细节。\n"
     "6. 只回复当前消息，不要夹带已回复过的旧话题。\n"
@@ -260,6 +261,39 @@ def _compact_reply_lines(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _message_send_delay_sec() -> float:
+    try:
+        value = float(getattr(config, "message_send_delay_sec", 0.0))
+    except Exception:
+        value = 0.0
+    return max(0.0, value)
+
+
+def _split_sentences(text: str) -> List[str]:
+    if not text:
+        return []
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in normalized.split("\n") if line.strip()]
+    sentences: List[str] = []
+    for line in lines:
+        parts = _SENTENCE_SPLIT_RE.split(line)
+        buffer = ""
+        for part in parts:
+            if not part:
+                continue
+            if _SENTENCE_SPLIT_RE.fullmatch(part):
+                buffer = f"{buffer}{part}"
+                sentences.append(buffer.strip())
+                buffer = ""
+            else:
+                if buffer:
+                    sentences.append(buffer.strip())
+                buffer = part
+        if buffer:
+            sentences.append(buffer.strip())
+    return [item for item in sentences if item]
+
+
 def _forward_line_threshold() -> int:
     try:
         threshold = int(getattr(config, "forward_line_threshold", 0))
@@ -291,7 +325,15 @@ async def _send_text_response(
         return
     lines = [line.strip() for line in str(text).splitlines() if line.strip()]
     if len(lines) <= _forward_line_threshold():
-        await send_func(text)
+        sentences = _split_sentences(str(text))
+        if len(sentences) <= 1:
+            await send_func(text)
+            return
+        delay = _message_send_delay_sec()
+        for idx, sentence in enumerate(sentences):
+            await send_func(sentence)
+            if delay > 0 and idx < len(sentences) - 1:
+                await asyncio.sleep(delay)
         return
     nickname = _bot_display_name(bot)
     self_id = _coerce_int(getattr(event, "self_id", None))

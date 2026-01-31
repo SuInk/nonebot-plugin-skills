@@ -15,6 +15,7 @@ class Config(BaseModel):
     history_ttl_sec: int = 600
     history_max_messages: int = 10
     forward_line_threshold: int = 8
+    message_send_delay_sec: float = 0.6
     gemini_log_response: bool = False
     nlp_enable: bool = True
     bot_keywords: List[str] = []
