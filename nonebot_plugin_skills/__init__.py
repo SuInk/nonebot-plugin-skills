@@ -13,7 +13,6 @@ from google import genai
 from google.genai import types
 from nonebot import get_driver, logger, on_command, on_message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageEvent, MessageSegment
-from nonebot.exception import FinishedException
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata
 
@@ -45,6 +44,8 @@ def _safe_error_message(exc: Exception) -> str:
         response_text = _truncate(exc.response.text)
         detail = f"{detail} | response: {response_text}"
     detail = _mask_api_key(detail)
+    detail = detail.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    detail = _collapse_spaces(detail)
     if detail:
         return detail
     return f"{type(exc).__name__}: 未知错误"
@@ -58,19 +59,22 @@ _MD_BOLD = re.compile(r"\*\*(.*?)\*\*")
 _MD_UNDERLINE = re.compile(r"__(.*?)__")
 _MD_STRIKE = re.compile(r"~~(.*?)~~")
 _MD_HRULE = re.compile(r"^\s*([-*_]\s*){3,}$", re.M)
+_MD_LIST_MARKER = re.compile(r"^\s*(?:[-*+•·＊]|\d+[).、])\s*")
+_LINE_SPLIT_RE = re.compile(r"\r?\n+")
 
-_MODEL_REPLY_MAX_CHARS = 50
-_WAIT_NEXT_IMAGE_SEC = 20.0
+_MODEL_REPLY_MAX_CHARS = 0
+_WAIT_NEXT_IMAGE_SEC = 60.0
 
 _CHAT_SYSTEM_PROMPT = (
     "Role\n"
+    "你是asoul成员嘉然，会尽量满足提问者的帮助。\n"
     "你是一个普通 QQ 用户，正在和朋友私聊或群聊。\n\n"
     "Goal\n"
     "根据对方消息给出自然、简短、真实的回复。\n\n"
     "Rules\n"
     "1. 只当普通人，不要自称 AI/助手，也不要提系统或规则。\n"
-    "2. 输出纯文本，不使用 Markdown、列表、编号或代码块。\n"
-    "3. 口语、简短，必要时分成 1-3 行；少用句号，问号和感叹号克制。\n"
+    "2. 输出纯文本，不使用 Markdown 或代码块。\n"
+    "3. 适合 QQ 消息，精炼、不啰嗦；口语、简短，可自然换行；少用句号，问号和感叹号克制。\n"
     "4. 不要夸张表演，不堆流行语，不写长段解释。\n"
     "5. 不清楚就简短追问，不编造细节。\n"
     "6. 只回复当前消息，不要夹带已回复过的旧话题。\n"
@@ -79,9 +83,18 @@ _CHAT_SYSTEM_PROMPT = (
 )
 
 _IMAGE_CHAT_SYSTEM_PROMPT = (
+    "你现在是asoul成员嘉然，会尽量满足提问者的帮助。\n"
     "你在进行图片内容对话，只需回答当前指令或问题。\n"
-    "不要补充已回复过的历史话题，不要输出 Markdown。\n"
-    "回答简短、口语化，必要时分行。\n"
+    "不要补充已回复过的历史话题，不要输出 Markdown 或代码块。\n"
+    "回答适合 QQ 消息，精炼、不啰嗦，简短、口语化，可自然换行。\n"
+)
+
+_TRAVEL_SYSTEM_PROMPT = (
+    "你是旅行规划助手，给出清晰、实用、可执行的旅行建议。\n"
+    "输出纯文本，不使用 Markdown 或代码块。\n"
+    "适合 QQ 消息，精炼、不啰嗦。\n"
+    "结构清晰，可自然换行，尽量不要空行，包含景点/活动/用餐/交通/住宿要点。\n"
+    "请自动生成该城市最常见的规划天数。\n"
 )
 
 _INTENT_SYSTEM_PROMPT = (
@@ -89,10 +102,11 @@ _INTENT_SYSTEM_PROMPT = (
     "不要输出拒绝/免责声明/权限说明（例如“我无法访问账号”）。"
     "严格输出如下 JSON："
     "{"
-    "\"action\": \"chat|image_chat|image_generate|image_create|weather|avatar_get|ignore\","
-    "\"target\": \"message_image|reply_image|at_user|last_image|sender_avatar|group_avatar|qq_avatar|message_id|wait_next|city|none\","
+    "\"action\": \"chat|image_chat|image_generate|image_create|weather|avatar_get|travel_plan|history_clear|ignore\","
+    "\"target\": \"message_image|reply_image|at_user|last_image|sender_avatar|group_avatar|qq_avatar|message_id|wait_next|city|trip|none\","
     "\"instruction\": \"string\","
-    "\"params\": {\"qq\": \"string\", \"message_id\": \"int\", \"city\": \"string\"}"
+    "\"params\": {\"qq\": \"string\", \"message_id\": \"int\", \"city\": \"string\","
+    " \"destination\": \"string\", \"days\": \"int\", \"nights\": \"int\", \"reply\": \"string\"}"
     "}"
     "说明："
     "- action=chat 表示普通聊天；instruction 为要回复的文本。"
@@ -101,6 +115,9 @@ _INTENT_SYSTEM_PROMPT = (
     "- action=image_create 表示无参考图生成；instruction 为生成指令。"
     "- action=weather 表示查询天气；instruction 为地点，target=city，params.city 填地点。"
     "- action=avatar_get 表示获取头像；instruction 可为空，target 可为 sender_avatar 或 group_avatar 等。"
+    "- action=travel_plan 表示旅行规划；instruction 为完整需求；target=trip；"
+    "params.destination 为目的地，params.days 为天数，params.nights 为晚数。"
+    "- action=history_clear 表示清除当前会话（当前聊天或群）历史记录；instruction 为空或简短确认。"
     "- action=ignore 表示不处理；instruction 为空字符串。"
     "- target 仅在 image_chat/image_generate 时使用："
     "  message_image=本消息里的图；reply_image=回复消息里的图；"
@@ -112,6 +129,9 @@ _INTENT_SYSTEM_PROMPT = (
     "- target=qq_avatar 时填写 params.qq。"
     "- target=message_id 时填写 params.message_id。"
     "其他情况 params 为空对象。"
+    "若旅行或天气缺关键信息，仍输出对应 action，缺失字段留空。"
+    "上下文可能包含“昵称: 内容”的格式，需识别说话人。"
+    "如需发送等待/过渡语，可在 params.reply 中填写一句短句。"
     " 如果文本包含多行，默认第一行是当前消息；只有当前消息无法判断时才参考后续上下文/回复内容。"
 )
 
@@ -143,7 +163,7 @@ def _strip_markdown(text: str) -> str:
         line = raw_line.rstrip()
         line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
         line = re.sub(r"^\s{0,3}>\s?", "", line)
-        line = re.sub(r"^\s{0,3}([-*+]|\d+\.)\s+", "", line)
+        line = _MD_LIST_MARKER.sub("", line)
         lines.append(line)
     text = "\n".join(lines)
     text = _MD_HRULE.sub("", text)
@@ -187,14 +207,104 @@ def _ensure_plain_text(text: str) -> str:
     return text.strip()
 
 
+def _collapse_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_user_name(value: Optional[object]) -> str:
+    if value is None:
+        return ""
+    name = str(value).strip()
+    if not name:
+        return ""
+    name = name.replace("\r", " ").replace("\n", " ")
+    name = _collapse_spaces(name)
+    return name.strip(":：")
+
+
+def _event_user_name(event: MessageEvent) -> str:
+    sender = getattr(event, "sender", None)
+    name = None
+    if sender is not None:
+        name = getattr(sender, "card", None) or getattr(sender, "nickname", None)
+    if not name:
+        name = getattr(event, "user_id", None)
+    return _normalize_user_name(name)
+
+
+def _sender_user_name(sender: object) -> str:
+    if sender is None:
+        return ""
+    name = getattr(sender, "card", None) or getattr(sender, "nickname", None)
+    if not name:
+        name = getattr(sender, "user_id", None)
+    return _normalize_user_name(name)
+
+
+def _format_context_line(text: str, user_name: Optional[str]) -> str:
+    name = _normalize_user_name(user_name)
+    if name:
+        return f"{name}: {text}"
+    return text
+
+
+def _compact_reply_lines(text: str) -> str:
+    if not text:
+        return text
+    lines = [line.strip() for line in text.split("\n")]
+    lines = [line for line in lines if line]
+    return "\n".join(lines).strip()
+
+
+def _transition_text(action: str) -> Optional[str]:
+    if action in {"image_create"}:
+        return "正在生成图片，请稍候..."
+    if action in {"image_generate"}:
+        return "正在处理图片，请稍候..."
+    if action in {"weather", "travel_plan", "avatar_get", "image_chat"}:
+        return "我看看喵"
+    return None
+
+
+def _intent_transition_text(intent: dict) -> str:
+    params = _intent_params(intent)
+    reply = params.get("reply")
+    if isinstance(reply, str):
+        return reply.strip()
+    return ""
+
+
+async def _send_transition(action: str, send_func) -> None:
+    text = _transition_text(action)
+    if text:
+        await send_func(text)
+
+
+def _format_reply_text(text: str) -> str:
+    if not text:
+        return text
+    cleaned = _ensure_plain_text(text)
+    if not cleaned:
+        return ""
+    normalized = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in normalized.split("\n")]
+    normalized = "\n".join(lines)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
+
+
 def _limit_reply_text(text: str, limit: int = _MODEL_REPLY_MAX_CHARS) -> str:
     if not text:
         return text
-    if limit <= 0:
-        return ""
-    if len(text) <= limit:
+    try:
+        limit_value = int(limit)
+    except Exception:
         return text
-    return text[:limit]
+    if limit_value <= 0:
+        return text
+    if len(text) <= limit_value:
+        return text
+    return text[:limit_value]
 
 
 def _redact_large_data(value: object, depth: int = 0) -> object:
@@ -252,6 +362,7 @@ class HistoryItem:
     text: str
     ts: float
     user_id: Optional[str] = None
+    user_name: Optional[str] = None
     to_bot: bool = False
     message_id: Optional[int] = None
 
@@ -332,6 +443,19 @@ def _prune_state(state: SessionState) -> None:
         state.handled_texts = {
             key: ts for key, ts in state.handled_texts.items() if ts >= text_cutoff
         }
+
+
+def _clear_session_state(state: SessionState) -> None:
+    state.history = []
+    state.last_image_url = None
+    state.image_cache = {}
+    if state.pending_image_waiters:
+        for waiter in state.pending_image_waiters.values():
+            if not waiter.done():
+                waiter.cancel()
+    state.pending_image_waiters = {}
+    state.handled_message_ids = {}
+    state.handled_texts = {}
 
 
 _UNSUPPORTED_IMAGE_EXTS = (".gif", ".apng")
@@ -456,6 +580,33 @@ def _format_measure(value: Optional[float], unit: str, digits: int = 1) -> str:
     return f"{_format_number(value, digits)}{unit}"
 
 
+def _wind_level_from_speed(value: Optional[float], unit: str) -> str:
+    if value is None:
+        return "风力未知"
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        return "风力未知"
+    unit_text = (unit or "").lower()
+    speed_mps = speed
+    if "km" in unit_text:
+        speed_mps = speed / 3.6
+    elif "m/s" in unit_text or "mps" in unit_text:
+        speed_mps = speed
+    elif "mph" in unit_text:
+        speed_mps = speed * 0.44704
+    # Beaufort scale (m/s)
+    thresholds = [0.3, 1.6, 3.4, 5.5, 8.0, 10.8, 13.9, 17.2, 20.8, 24.5, 28.5, 32.7]
+    level = 0
+    for idx, limit in enumerate(thresholds):
+        if speed_mps < limit:
+            level = idx
+            break
+    else:
+        level = 12
+    return f"风力{level}级"
+
+
 def _weather_code_desc(code: Optional[float]) -> str:
     if code is None:
         return "未知天气"
@@ -516,17 +667,17 @@ def _weather_clothing_advice(
             base = "注意增减衣物"
         else:
             if temp >= 30:
-                base = "短袖短裤，注意防晒"
+                base = "有点热 注意防晒"
             elif temp >= 26:
-                base = "短袖为主，早晚可薄外套"
+                base = "偏热 注意防晒"
             elif temp >= 20:
-                base = "薄长袖或短袖加薄外套"
+                base = "比较舒服 注意早晚温差"
             elif temp >= 12:
-                base = "长袖配外套"
+                base = "有点凉 注意保暖"
             elif temp >= 5:
-                base = "毛衣加外套"
+                base = "偏冷 注意保暖"
             else:
-                base = "厚外套，注意保暖"
+                base = "很冷 注意保暖"
 
     extras: List[str] = []
     if _is_rain_code(weather_code):
@@ -534,7 +685,7 @@ def _weather_clothing_advice(
     if _is_snow_code(weather_code):
         extras.append("注意防滑")
     if extras:
-        return f"{base}，{'，'.join(extras)}"
+        return f"{base} {'，'.join(extras)}"
     return base
 
 
@@ -577,21 +728,18 @@ async def _build_weather_messages(query: str) -> List[str]:
     current = data.get("current", {}) if isinstance(data, dict) else {}
     units = data.get("current_units", {}) if isinstance(data, dict) else {}
     temp_unit = units.get("temperature_2m") or "°C"
-    humidity_unit = units.get("relative_humidity_2m") or "%"
     wind_unit = units.get("wind_speed_10m") or "m/s"
     temp_value = current.get("temperature_2m")
-    humidity_value = current.get("relative_humidity_2m")
     wind_value = current.get("wind_speed_10m")
     weather_code = current.get("weather_code")
     temp = _format_measure(temp_value, temp_unit)
-    humidity = _format_measure(humidity_value, humidity_unit, digits=0)
-    wind = _format_measure(wind_value, wind_unit)
+    wind_level = _wind_level_from_speed(wind_value, str(wind_unit))
     code_desc = _weather_code_desc(weather_code)
     advice = _weather_clothing_advice(temp_value, weather_code)
-    line2 = f"{display_name} 现在{temp} {code_desc} 湿度{humidity} 风{wind}"
-    line3 = f"穿衣建议：{advice}"
-
-    return [line2, line3]
+    line2 = f"{display_name} 现在{temp} {code_desc} {wind_level}"
+    line3 = f"{advice}"
+    reply = _format_reply_text(f"{line2} {line3}")
+    return [reply] if reply else []
 
 
 async def _geocode_location(query: str) -> Optional[dict]:
@@ -625,10 +773,15 @@ async def _fetch_current_weather(lat: float, lon: float) -> Optional[dict]:
 def _history_to_gemini(state: SessionState) -> List[types.Content]:
     contents: List[types.Content] = []
     for item in state.history:
+        text = item.text
+        if item.role == "user":
+            name = _normalize_user_name(item.user_name) or _normalize_user_name(item.user_id)
+            if name:
+                text = f"{name}: {text}"
         contents.append(
             types.Content(
                 role=item.role,
-                parts=[types.Part.from_text(text=item.text)],
+                parts=[types.Part.from_text(text=text)],
             )
         )
     return contents
@@ -731,14 +884,65 @@ async def _call_gemini_text(prompt: str, state: SessionState) -> str:
         logger.info("Gemini text response: {}", _dump_response(response))
         _log_response_text("Gemini text content", response)
     if response.text:
-        cleaned = _ensure_plain_text(response.text.strip())
+        cleaned = _format_reply_text(response.text.strip())
+        cleaned = _compact_reply_lines(cleaned)
         cleaned = _limit_reply_text(cleaned)
         return cleaned
     text_parts: List[str] = []
     for part in _iter_response_parts(response):
         if getattr(part, "text", None):
             text_parts.append(getattr(part, "text"))
-    cleaned = _ensure_plain_text("\n".join(text_parts).strip())
+    cleaned = _format_reply_text("\n".join(text_parts).strip())
+    cleaned = _compact_reply_lines(cleaned)
+    cleaned = _limit_reply_text(cleaned)
+    return cleaned
+
+
+def _build_travel_prompt(intent: dict) -> str:
+    params = _intent_params(intent)
+    destination = params.get("destination") or ""
+    instruction = str(intent.get("instruction") or "").strip()
+    dest_text = str(destination).strip()
+    cleaned_instruction = _strip_travel_duration(instruction)
+    parts = [_TRAVEL_SYSTEM_PROMPT.strip()]
+    if dest_text:
+        parts.append(f"请规划{dest_text}旅行行程。")
+    else:
+        parts.append("请规划旅行行程。")
+    if cleaned_instruction:
+        parts.append(f"需求补充：{cleaned_instruction}")
+    parts.append(
+        "输出要求：纯文本，结构清晰，可自然换行，包含景点/活动/用餐/交通/住宿要点。"
+    )
+    return "\n".join(parts)
+
+
+async def _call_gemini_travel_plan(intent: dict, state: SessionState) -> str:
+    client = _get_client()
+    contents = _history_to_gemini(state)
+    prompt = _build_travel_prompt(intent)
+    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
+    config_obj, _ = _build_generate_config()
+    response = await asyncio.wait_for(
+        client.aio.models.generate_content(
+            model=config.gemini_text_model,
+            contents=contents,
+            config=config_obj,
+        ),
+        timeout=config.request_timeout,
+    )
+    if config.gemini_log_response:
+        logger.info("Gemini travel response: {}", _dump_response(response))
+        _log_response_text("Gemini travel content", response)
+    if response.text:
+        cleaned = _format_reply_text(response.text.strip())
+        cleaned = _limit_reply_text(cleaned)
+        return cleaned
+    text_parts: List[str] = []
+    for part in _iter_response_parts(response):
+        if getattr(part, "text", None):
+            text_parts.append(getattr(part, "text"))
+    cleaned = _format_reply_text("\n".join(text_parts).strip())
     cleaned = _limit_reply_text(cleaned)
     return cleaned
 
@@ -794,11 +998,11 @@ async def _call_gemini_image(prompt: str, image_url: str, state: SessionState) -
             if isinstance(data, str):
                 return True, data
         if text_value:
-            cleaned = _ensure_plain_text(text_value)
+            cleaned = _format_reply_text(text_value)
             cleaned = _limit_reply_text(cleaned)
             return False, cleaned or "（没有生成到有效文本）"
     if getattr(response, "text", None):
-        cleaned = _ensure_plain_text(getattr(response, "text"))
+        cleaned = _format_reply_text(getattr(response, "text"))
         cleaned = _limit_reply_text(cleaned)
         return False, cleaned or "（没有生成到有效文本）"
     raise RuntimeError("未获取到有效图片结果")
@@ -841,7 +1045,7 @@ async def _call_gemini_image_chat(prompt: str, image_url: str, state: SessionSta
         logger.info("Gemini image chat response: {}", _dump_response(response))
         _log_response_text("Gemini image chat content", response)
     if response.text:
-        cleaned = _ensure_plain_text(response.text.strip())
+        cleaned = _format_reply_text(response.text.strip())
         cleaned = _limit_reply_text(cleaned)
         return cleaned
     text_parts: List[str] = []
@@ -849,7 +1053,7 @@ async def _call_gemini_image_chat(prompt: str, image_url: str, state: SessionSta
         text_value = _extract_text_value(part)
         if text_value:
             text_parts.append(text_value)
-    cleaned = _ensure_plain_text("\n".join(text_parts).strip())
+    cleaned = _format_reply_text("\n".join(text_parts).strip())
     cleaned = _limit_reply_text(cleaned)
     return cleaned
 
@@ -883,11 +1087,11 @@ async def _call_gemini_text_to_image(prompt: str, state: SessionState) -> Tuple[
             if isinstance(data, str):
                 return True, data
         if text_value:
-            cleaned = _ensure_plain_text(text_value)
+            cleaned = _format_reply_text(text_value)
             cleaned = _limit_reply_text(cleaned)
             return False, cleaned or "（没有生成到有效文本）"
     if getattr(response, "text", None):
-        cleaned = _ensure_plain_text(getattr(response, "text"))
+        cleaned = _format_reply_text(getattr(response, "text"))
         cleaned = _limit_reply_text(cleaned)
         return False, cleaned or "（没有生成到有效文本）"
     raise RuntimeError("未获取到有效图片结果")
@@ -911,6 +1115,7 @@ def _append_history(
     text: str,
     *,
     user_id: Optional[str] = None,
+    user_name: Optional[str] = None,
     to_bot: bool = False,
     ts: Optional[float] = None,
     message_id: Optional[int] = None,
@@ -921,6 +1126,7 @@ def _append_history(
             text=text,
             ts=_now() if ts is None else ts,
             user_id=user_id,
+            user_name=user_name,
             to_bot=to_bot,
             message_id=message_id,
         )
@@ -933,6 +1139,7 @@ nlp_handler = on_message(priority=15, block=False)
 avatar_handler = on_command("处理头像", priority=5)
 chat_handler = on_command("技能", aliases={"聊天", "对话"}, priority=5)
 weather_handler = on_command("天气", aliases={"查询天气", "查天气"}, priority=5)
+travel_handler = on_command("旅行规划", aliases={"旅行计划", "行程规划", "旅行", "行程"}, priority=5)
 
 
 @history_collector.handle()
@@ -950,11 +1157,13 @@ async def _collect_history(event: MessageEvent):
         _notify_pending_image(state, str(event.get_user_id()), image_url)
 
     if text:
+        user_name = _event_user_name(event)
         _append_history(
             state,
             "user",
             text,
             user_id=str(event.get_user_id()),
+            user_name=user_name,
             to_bot=_should_trigger_nlp(event, text),
             ts=_event_ts(event),
             message_id=getattr(event, "message_id", None),
@@ -971,7 +1180,20 @@ def _is_command_message(text: str) -> bool:
         starts = ["/"]
     if not starts:
         return False
-    command_words = ["处理头像", "技能", "聊天", "对话", "天气", "查询天气", "查天气"]
+    command_words = [
+        "处理头像",
+        "技能",
+        "聊天",
+        "对话",
+        "天气",
+        "查询天气",
+        "查天气",
+        "旅行规划",
+        "旅行计划",
+        "行程规划",
+        "旅行",
+        "行程",
+    ]
     for prefix in starts:
         if not prefix:
             continue
@@ -1023,15 +1245,18 @@ def _should_trigger_nlp(event: MessageEvent, text: str) -> bool:
     return True
 
 
-def _extract_reply_text(event: MessageEvent, state: SessionState) -> Optional[str]:
+def _extract_reply_context(
+    event: MessageEvent,
+    state: SessionState,
+) -> Tuple[Optional[str], Optional[str]]:
     reply = getattr(event, "reply", None)
     if not reply:
-        return None
+        return None, None
     reply_id = getattr(reply, "message_id", None)
     if reply_id is not None:
         for item in reversed(state.history):
             if item.message_id == reply_id:
-                return item.text
+                return item.text, (item.user_name or item.user_id)
     reply_message = getattr(reply, "message", None)
     if reply_message:
         try:
@@ -1039,8 +1264,10 @@ def _extract_reply_text(event: MessageEvent, state: SessionState) -> Optional[st
         except Exception:
             text = None
         if text:
-            return text
-    return None
+            sender_name = _sender_user_name(getattr(reply, "sender", None))
+            return text, sender_name or None
+    sender_name = _sender_user_name(getattr(reply, "sender", None))
+    return None, sender_name or None
 
 
 def _extract_reply_image_url(event: MessageEvent, state: SessionState) -> Optional[str]:
@@ -1118,7 +1345,7 @@ async def _resolve_image_url(
 
 def _collect_context_messages(
     state: SessionState,
-    user_id: str,
+    current_user_id: str,
     *,
     ts: float,
     limit: int,
@@ -1132,17 +1359,16 @@ def _collect_context_messages(
     for item in items:
         if item.role != "user":
             continue
-        if item.user_id != user_id:
-            continue
         if not item.to_bot:
             continue
         if future and item.ts <= ts:
             continue
         if not future and item.ts > ts:
             continue
-        if item.text == current_text:
+        if item.text == current_text and item.user_id == current_user_id:
             continue
-        texts.append(item.text)
+        line = _format_context_line(item.text, item.user_name or item.user_id)
+        texts.append(line)
         if len(texts) >= limit:
             break
     if future:
@@ -1197,7 +1423,7 @@ async def _build_intent_text(
 
     ts = _event_ts(event)
     user_id = str(event.get_user_id())
-    reply_text = _extract_reply_text(event, state)
+    reply_text, reply_name = _extract_reply_context(event, state)
 
     prev_texts = _collect_context_messages(
         state,
@@ -1220,7 +1446,18 @@ async def _build_intent_text(
             current_text=text,
         )
 
-    combined = [part for part in [text, reply_text, *prev_texts, *future_texts] if part]
+    reply_line = ""
+    if reply_text:
+        reply_line = (
+            _format_context_line(reply_text, reply_name)
+            if reply_name
+            else f"回复内容: {reply_text}"
+        )
+    combined = [
+        part
+        for part in [text, reply_line, *prev_texts, *future_texts]
+        if part
+    ]
     if not combined:
         return text
     return "\n".join(combined)
@@ -1231,12 +1468,17 @@ def _build_primary_intent_text(
     state: SessionState,
     text: str,
 ) -> str:
-    reply_text = _extract_reply_text(event, state)
+    reply_text, reply_name = _extract_reply_context(event, state)
     if not reply_text:
         return text
     if reply_text.strip() == text.strip():
         return text
-    return f"{text}\n回复内容: {reply_text}"
+    reply_line = (
+        _format_context_line(reply_text, reply_name)
+        if reply_name
+        else f"回复内容: {reply_text}"
+    )
+    return "\n".join([text, reply_line])
 
 
 _ALLOWED_ACTIONS = {
@@ -1246,6 +1488,8 @@ _ALLOWED_ACTIONS = {
     "image_create",
     "weather",
     "avatar_get",
+    "travel_plan",
+    "history_clear",
     "ignore",
 }
 _ALLOWED_TARGETS = {
@@ -1258,6 +1502,7 @@ _ALLOWED_TARGETS = {
     "qq_avatar",
     "message_id",
     "wait_next",
+    "trip",
     "none",
 }
 
@@ -1344,13 +1589,389 @@ def _normalize_intent(
             "params": {"city": city} if city else {},
         }
 
+    if action == "travel_plan":
+        days = _coerce_int(params.get("days"))
+        nights = _coerce_int(params.get("nights"))
+        destination = ""
+        raw_destination = params.get("destination") or params.get("city")
+        if isinstance(raw_destination, str):
+            destination = raw_destination.strip()
+        if (days is None or nights is None) and isinstance(instruction, str):
+            parsed_days, parsed_nights = _extract_travel_duration(instruction)
+            if days is None:
+                days = parsed_days
+            if nights is None:
+                nights = parsed_nights
+        if not destination and isinstance(instruction, str):
+            destination = _extract_travel_destination(instruction) or ""
+        normalized_params: dict[str, object] = {}
+        if days is not None:
+            normalized_params["days"] = days
+        if nights is not None:
+            normalized_params["nights"] = nights
+        if destination:
+            normalized_params["destination"] = destination
+        return {
+            "action": action,
+            "instruction": instruction.strip(),
+            "target": "trip",
+            "params": normalized_params,
+        }
+
     return {"action": action, "instruction": instruction.strip(), "params": params}
+
+
+async def _build_travel_plan_reply(
+    intent: dict,
+    state: SessionState,
+    event: MessageEvent,
+) -> Optional[str]:
+    params = _intent_params(intent)
+    destination = params.get("destination")
+    destination_text = destination.strip() if isinstance(destination, str) else ""
+    if not destination_text:
+        return "请告诉我目的地，例如：北京"
+    normalized_params = dict(params)
+    normalized_params["destination"] = destination_text
+    intent = dict(intent)
+    intent["params"] = normalized_params
+    reply = await _call_gemini_travel_plan(intent, state)
+    if not reply:
+        return None
+    instruction = str(intent.get("instruction") or "").strip()
+    cleaned_instruction = _strip_travel_duration(instruction)
+    summary = f"{destination_text}"
+    if cleaned_instruction and cleaned_instruction not in summary:
+        summary = f"{summary} 需求:{cleaned_instruction}"
+    user_name = _event_user_name(event)
+    _append_history(
+        state,
+        "user",
+        f"旅行规划：{summary}",
+        user_id=str(event.get_user_id()),
+        user_name=user_name,
+        to_bot=True,
+    )
+    _append_history(state, "model", reply)
+    return reply
+
+
+async def _dispatch_intent(
+    intent: dict,
+    state: SessionState,
+    event: MessageEvent,
+    text: str,
+    *,
+    image_url: Optional[str],
+    reply_image_url: Optional[str],
+    at_user: Optional[str],
+    send_func,
+) -> None:
+    action = str(intent.get("action", "ignore")).lower()
+    if action == "ignore":
+        return
+    user_name = _event_user_name(event)
+
+    if action == "chat":
+        prompt = intent.get("instruction")
+        try:
+            reply = await _call_gemini_text(str(prompt), state)
+            if not reply:
+                return
+            _append_history(
+                state,
+                "user",
+                str(prompt),
+                user_id=str(event.get_user_id()),
+                user_name=user_name,
+                to_bot=True,
+            )
+            _append_history(state, "model", reply)
+            await send_func(reply)
+            _mark_handled_request(state, event, text)
+        except Exception as exc:
+            logger.error("NLP chat failed: {}", _safe_error_message(exc))
+        return
+
+    if action == "weather":
+        query = str(intent.get("instruction") or "").strip()
+        if not query:
+            await send_func("请告诉我城市或地区，例如：天气 北京")
+            return
+        await _send_transition(action, send_func)
+        try:
+            messages = await _build_weather_messages(query)
+            if not messages:
+                return
+            reply_text = "\n".join(messages)
+            _append_history(
+                state,
+                "user",
+                f"天气：{query}",
+                user_id=str(event.get_user_id()),
+                user_name=user_name,
+                to_bot=True,
+            )
+            _append_history(state, "model", reply_text)
+            for msg in messages:
+                await send_func(msg)
+            _mark_handled_request(state, event, text)
+        except Exception as exc:
+            logger.error("NLP weather failed: {}", _safe_error_message(exc))
+            await send_func(f"出错了：{_safe_error_message(exc)}")
+        return
+
+    if action == "travel_plan":
+        params = _intent_params(intent)
+        destination = params.get("destination")
+        if not isinstance(destination, str) or not destination.strip():
+            await send_func("请告诉我目的地，例如：北京")
+            return
+        await _send_transition(action, send_func)
+        try:
+            reply = await _build_travel_plan_reply(intent, state, event)
+            if not reply:
+                return
+            await send_func(reply)
+            _mark_handled_request(state, event, text)
+        except Exception as exc:
+            logger.error("NLP travel failed: {}", _safe_error_message(exc))
+            await send_func(f"出错了：{_safe_error_message(exc)}")
+        return
+
+    if action == "history_clear":
+        _clear_session_state(state)
+        await send_func("已清除当前会话记录，可以继续聊啦。")
+        return
+
+    if action == "avatar_get":
+        target = str(intent.get("target") or "").lower()
+        params = _intent_params(intent)
+        if target == "qq_avatar" and not params.get("qq"):
+            await send_func("请提供 QQ 号。")
+            return
+        await _send_transition(action, send_func)
+        image_url = await _resolve_image_url(
+            intent,
+            event=event,
+            state=state,
+            current_image_url=None,
+            reply_image_url=None,
+            at_user=at_user,
+        )
+        if not image_url:
+            await send_func("未找到可用的头像。")
+            return
+        await send_func(_image_segment_from_result(image_url))
+        _mark_handled_request(state, event, text)
+        return
+
+    prompt = str(intent.get("instruction"))
+    target = str(intent.get("target") or "").lower()
+    params = _intent_params(intent)
+
+    if action == "image_create":
+        transition_text = _intent_transition_text(intent)
+        if transition_text:
+            await send_func(transition_text)
+        try:
+            is_image, result = await _call_gemini_text_to_image(prompt, state)
+            _append_history(
+                state,
+                "user",
+                f"生成图片：{prompt}",
+                user_id=str(event.get_user_id()),
+                user_name=user_name,
+                to_bot=True,
+            )
+            if is_image:
+                _append_history(state, "model", "[已生成图片]")
+                await send_func("已生成图片。")
+                await send_func(_image_segment_from_result(result))
+                _mark_handled_request(state, event, text)
+            else:
+                _append_history(state, "model", result)
+                await send_func(f"生成结果：{result}")
+                _mark_handled_request(state, event, text)
+        except Exception as exc:
+            logger.error("NLP image create failed: {}", _safe_error_message(exc))
+            await send_func(f"出错了：{_safe_error_message(exc)}")
+        return
+
+    if action not in {"image_chat", "image_generate"}:
+        return
+
+    if target == "qq_avatar" and not params.get("qq"):
+        await send_func("请提供 QQ 号。")
+        return
+    if target == "message_id" and not params.get("message_id"):
+        await send_func("请提供消息 ID。")
+        return
+    if target == "wait_next":
+        await send_func("请在60秒内发送图片。")
+
+    image_url = await _resolve_image_url(
+        intent,
+        event=event,
+        state=state,
+        current_image_url=image_url,
+        reply_image_url=reply_image_url,
+        at_user=at_user,
+    )
+    if not image_url:
+        await send_func("未找到可处理的图片或头像。")
+        return
+
+    if action == "image_chat":
+        try:
+            await _send_transition(action, send_func)
+            reply = await _call_gemini_image_chat(prompt, image_url, state)
+            if not reply:
+                return
+            _append_history(
+                state,
+                "user",
+                f"聊图：{prompt}",
+                user_id=str(event.get_user_id()),
+                user_name=user_name,
+                to_bot=True,
+            )
+            _append_history(state, "model", reply)
+            await send_func(reply)
+            _mark_handled_request(state, event, text)
+        except UnsupportedImageError:
+            await send_func("这个格式我处理不了，发张静态图吧。")
+        except Exception as exc:
+            logger.error("NLP image chat failed: {}", _safe_error_message(exc))
+            await send_func(f"出错了：{_safe_error_message(exc)}")
+        return
+
+    try:
+        transition_text = _intent_transition_text(intent)
+        if transition_text:
+            await send_func(transition_text)
+        is_image, result = await _call_gemini_image(prompt, image_url, state)
+        _append_history(
+            state,
+            "user",
+            f"处理头像：{prompt}",
+            user_id=str(event.get_user_id()),
+            user_name=user_name,
+            to_bot=True,
+        )
+        if is_image:
+            _append_history(state, "model", "[已生成图片]")
+            await send_func("已完成修改。")
+            await send_func(_image_segment_from_result(result))
+            _mark_handled_request(state, event, text)
+        else:
+            _append_history(state, "model", result)
+            await send_func(f"修改结果：{result}")
+            _mark_handled_request(state, event, text)
+    except UnsupportedImageError:
+        await send_func("这个格式我处理不了，发张静态图吧。")
+    except Exception as exc:
+        logger.error("NLP image failed: {}", _safe_error_message(exc))
+        await send_func(f"出错了：{_safe_error_message(exc)}")
 
 
 def _clarify_intent_text(has_image: bool) -> str:
     if has_image:
-        return "我没太听懂，你是想聊这张图、处理图片还是查天气？"
-    return "我没太听懂，你是想聊天、处理图片、无图生成还是查天气？"
+        return "我没太听懂，你是想聊这张图、处理图片、查天气还是旅行规划？"
+    return "我没太听懂，你是想聊天、处理图片、无图生成、查天气、旅行规划还是清除历史？"
+
+
+_TRAVEL_KEYWORDS = ("旅行", "旅游", "行程", "出行", "游玩")
+_TRAVEL_WEAK_KEYWORDS = ("规划", "计划")
+_TRAVEL_DAYS_RE = re.compile(r"([0-9]{1,2}|[零一二三四五六七八九十两]{1,3})\s*天")
+_TRAVEL_NIGHTS_RE = re.compile(r"([0-9]{1,2}|[零一二三四五六七八九十两]{1,3})\s*(?:晚|夜)")
+_TRAVEL_DEST_RE = re.compile(r"(?:去|到|在)\s*([\u4e00-\u9fffA-Za-z0-9]{1,20})")
+
+
+def _chinese_number_to_int(value: str) -> Optional[int]:
+    if not value:
+        return None
+    digits = {
+        "零": 0,
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }
+    if value.isdigit():
+        return int(value)
+    if value in digits:
+        return digits[value]
+    if value == "十":
+        return 10
+    if len(value) == 2 and value[0] == "十":
+        tail = digits.get(value[1])
+        return 10 + tail if tail is not None else None
+    if len(value) == 2 and value[1] == "十":
+        head = digits.get(value[0])
+        return head * 10 if head is not None else None
+    if len(value) == 3 and value[1] == "十":
+        head = digits.get(value[0])
+        tail = digits.get(value[2])
+        if head is None or tail is None:
+            return None
+        return head * 10 + tail
+    return None
+
+
+def _parse_travel_number(token: str) -> Optional[int]:
+    if not token:
+        return None
+    number = _coerce_int(token)
+    if number is not None:
+        return number
+    return _chinese_number_to_int(token)
+
+
+def _extract_travel_duration(text: str) -> Tuple[Optional[int], Optional[int]]:
+    days = None
+    nights = None
+    if not text:
+        return days, nights
+    day_match = _TRAVEL_DAYS_RE.search(text)
+    if day_match:
+        days = _parse_travel_number(day_match.group(1))
+    night_match = _TRAVEL_NIGHTS_RE.search(text)
+    if night_match:
+        nights = _parse_travel_number(night_match.group(1))
+    return days, nights
+
+
+def _extract_travel_destination(text: str) -> Optional[str]:
+    if not text:
+        return None
+    match = _TRAVEL_DEST_RE.search(text)
+    if match:
+        return match.group(1).strip()
+    cleaned = _TRAVEL_DAYS_RE.sub("", text)
+    cleaned = _TRAVEL_NIGHTS_RE.sub("", cleaned)
+    cleaned = re.sub(r"[，,。.!！?？/]", " ", cleaned)
+    for kw in _TRAVEL_KEYWORDS:
+        cleaned = cleaned.replace(kw, " ")
+    for kw in _TRAVEL_WEAK_KEYWORDS:
+        cleaned = cleaned.replace(kw, " ")
+    cleaned = cleaned.replace("去", " ").replace("到", " ").replace("在", " ")
+    cleaned = _collapse_spaces(cleaned)
+    return cleaned or None
+
+
+def _strip_travel_duration(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = _TRAVEL_DAYS_RE.sub("", text)
+    cleaned = _TRAVEL_NIGHTS_RE.sub("", cleaned)
+    return _collapse_spaces(cleaned)
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -1468,276 +2089,105 @@ async def _handle_natural_language(bot: Bot, event: MessageEvent):
     reply_id = getattr(reply, "message_id", None) if reply else None
     if reply_id is not None and isinstance(intent.get("params"), dict):
         intent["params"].setdefault("message_id", reply_id)
-
-    action = str(intent.get("action", "ignore")).lower()
-    if action == "ignore":
-        return
-
-    if action == "chat":
-        prompt = intent.get("instruction")
-        try:
-            reply = await _call_gemini_text(str(prompt), state)
-            if not reply:
-                return
-            _append_history(
-                state,
-                "user",
-                str(prompt),
-                user_id=str(event.get_user_id()),
-                to_bot=True,
-            )
-            _append_history(state, "model", reply)
-            await nlp_handler.send(reply)
-            _mark_handled_request(state, event, text)
-        except Exception as exc:
-            logger.error("NLP chat failed: {}", _safe_error_message(exc))
-        return
-
-    if action == "weather":
-        query = str(intent.get("instruction") or "").strip()
-        if not query:
-            await nlp_handler.send("请告诉我城市或地区，例如：天气 北京")
-            return
-        await nlp_handler.send("我看看喵")
-        try:
-            messages = await _build_weather_messages(query)
-            if not messages:
-                return
-            reply_text = "\n".join(messages)
-            _append_history(
-                state,
-                "user",
-                f"天气：{query}",
-                user_id=str(event.get_user_id()),
-                to_bot=True,
-            )
-            _append_history(state, "model", reply_text)
-            for msg in messages:
-                await nlp_handler.send(msg)
-            _mark_handled_request(state, event, text)
-        except Exception as exc:
-            logger.error("NLP weather failed: {}", _safe_error_message(exc))
-            await nlp_handler.send(f"出错了：{_safe_error_message(exc)}")
-        return
-
-    if action == "avatar_get":
-        target = str(intent.get("target") or "").lower()
-        params = _intent_params(intent)
-        if target == "qq_avatar" and not params.get("qq"):
-            await nlp_handler.send("请提供 QQ 号。")
-            return
-        image_url = await _resolve_image_url(
-            intent,
-            event=event,
-            state=state,
-            current_image_url=None,
-            reply_image_url=None,
-            at_user=at_user,
-        )
-        if not image_url:
-            await nlp_handler.send("未找到可用的头像。")
-            return
-        await nlp_handler.send(_image_segment_from_result(image_url))
-        _mark_handled_request(state, event, text)
-        return
-
-    prompt = str(intent.get("instruction"))
-    target = str(intent.get("target") or "").lower()
-    params = _intent_params(intent)
-
-    if action == "image_create":
-        await nlp_handler.send("正在生成图片，请稍候...")
-        try:
-            is_image, result = await _call_gemini_text_to_image(prompt, state)
-            _append_history(
-                state,
-                "user",
-                f"生成图片：{prompt}",
-                user_id=str(event.get_user_id()),
-                to_bot=True,
-            )
-            if is_image:
-                _append_history(state, "model", "[已生成图片]")
-                await nlp_handler.send(_image_segment_from_result(result))
-                _mark_handled_request(state, event, text)
-            else:
-                _append_history(state, "model", result)
-                await nlp_handler.send(f"返回文本结果：\n{result}")
-                _mark_handled_request(state, event, text)
-        except Exception as exc:
-            logger.error("NLP image create failed: {}", _safe_error_message(exc))
-            await nlp_handler.send(f"出错了：{_safe_error_message(exc)}")
-        return
-
-    if action not in {"image_chat", "image_generate"}:
-        return
-
-    if target == "qq_avatar" and not params.get("qq"):
-        await nlp_handler.send("请提供 QQ 号。")
-        return
-    if target == "message_id" and not params.get("message_id"):
-        await nlp_handler.send("请提供消息 ID。")
-        return
-    if target == "wait_next":
-        await nlp_handler.send("请在20秒内发送图片。")
-
-    image_url = await _resolve_image_url(
+    await _dispatch_intent(
         intent,
-        event=event,
-        state=state,
-        current_image_url=image_url,
+        state,
+        event,
+        text,
+        image_url=image_url,
         reply_image_url=reply_image_url,
         at_user=at_user,
+        send_func=nlp_handler.send,
     )
-    if not image_url:
-        await nlp_handler.send("未找到可处理的图片或头像。")
-        return
 
-    if action == "image_chat":
-        try:
-            reply = await _call_gemini_image_chat(prompt, image_url, state)
-            if not reply:
-                return
-            _append_history(
-                state,
-                "user",
-                f"聊图：{prompt}",
-                user_id=str(event.get_user_id()),
-                to_bot=True,
-            )
-            _append_history(state, "model", reply)
-            await nlp_handler.send(reply)
-            _mark_handled_request(state, event, text)
-        except UnsupportedImageError:
-            await nlp_handler.send("这个格式我处理不了，发张静态图吧。")
-        except Exception as exc:
-            logger.error("NLP image chat failed: {}", _safe_error_message(exc))
-            await nlp_handler.send(f"出错了：{_safe_error_message(exc)}")
-        return
 
-    await nlp_handler.send("正在生成图片，请稍候...")
+async def _handle_command_via_intent(
+    event: MessageEvent,
+    *,
+    text: str,
+    send_func,
+) -> None:
+    if not config.google_api_key:
+        await send_func("未配置 GOOGLE_API_KEY")
+        return
+    session_id = _session_id(event)
+    state = _get_state(session_id)
+    image_url = _extract_first_image_url(event.get_message())
+    at_user = _extract_at_user(event.get_message())
+    reply_image_url = _extract_reply_image_url(event, state)
+    has_image = image_url is not None
+    has_reply_image = reply_image_url is not None
     try:
-        is_image, result = await _call_gemini_image(prompt, image_url, state)
-        _append_history(
-            state,
-            "user",
-            f"处理头像：{prompt}",
-            user_id=str(event.get_user_id()),
-            to_bot=True,
+        intent_raw = await _classify_intent(
+            text, state, has_image, has_reply_image, at_user
         )
-        if is_image:
-            _append_history(state, "model", "[已生成图片]")
-            await nlp_handler.send(_image_segment_from_result(result))
-            _mark_handled_request(state, event, text)
-        else:
-            _append_history(state, "model", result)
-            await nlp_handler.send(f"返回文本结果：\n{result}")
-            _mark_handled_request(state, event, text)
-    except UnsupportedImageError:
-        await nlp_handler.send("这个格式我处理不了，发张静态图吧。")
     except Exception as exc:
-        logger.error("NLP image failed: {}", _safe_error_message(exc))
-        await nlp_handler.send(f"出错了：{_safe_error_message(exc)}")
+        logger.error("Intent classify failed: {}", _safe_error_message(exc))
+        await send_func("意图解析失败，请稍后再试。")
+        return
+    intent = _normalize_intent(intent_raw, has_image, has_reply_image, at_user, state)
+    if not intent:
+        await send_func(_clarify_intent_text(has_image))
+        return
+    reply = getattr(event, "reply", None)
+    reply_id = getattr(reply, "message_id", None) if reply else None
+    if reply_id is not None and isinstance(intent.get("params"), dict):
+        intent["params"].setdefault("message_id", reply_id)
+    await _dispatch_intent(
+        intent,
+        state,
+        event,
+        text,
+        image_url=image_url,
+        reply_image_url=reply_image_url,
+        at_user=at_user,
+        send_func=send_func,
+    )
 
 
 @avatar_handler.handle()
 async def handle_avatar(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
-    session_id = _session_id(event)
-    state = _get_state(session_id)
-
     prompt = args.extract_plain_text().strip()
     if not prompt:
         await avatar_handler.finish("请告诉我你想怎么处理头像，例如：处理头像 变成赛博朋克风")
-
-    image_url = _extract_first_image_url(event.get_message())
-    if not image_url:
-        at_user = _extract_at_user(event.get_message())
-        if at_user:
-            image_url = _avatar_url(at_user)
-        elif state.last_image_url:
-            image_url = state.last_image_url
-        else:
-            image_url = _avatar_url(event.get_user_id())
-
-    await avatar_handler.send("正在生成图片，请稍候...")
-    try:
-        is_image, result = await _call_gemini_image(prompt, image_url, state)
-        _append_history(
-            state,
-            "user",
-            f"处理头像：{prompt}",
-            user_id=str(event.get_user_id()),
-            to_bot=True,
-        )
-        if is_image:
-            _append_history(state, "model", "[已生成图片]")
-            await avatar_handler.finish(_image_segment_from_result(result))
-        else:
-            _append_history(state, "model", result)
-            await avatar_handler.finish(f"返回文本结果：\n{result}")
-    except FinishedException:
-        raise
-    except UnsupportedImageError:
-        await avatar_handler.finish("这个格式我处理不了，发张静态图吧。")
-    except Exception as exc:
-        logger.error("Avatar handler failed: {}", _safe_error_message(exc))
-        await avatar_handler.finish(f"出错了：{_safe_error_message(exc)}")
+    await _handle_command_via_intent(
+        event,
+        text=f"处理头像 {prompt}",
+        send_func=avatar_handler.send,
+    )
 
 
 @chat_handler.handle()
 async def handle_chat(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
-    session_id = _session_id(event)
-    state = _get_state(session_id)
     prompt = args.extract_plain_text().strip()
     if not prompt:
         await chat_handler.finish("请发送要聊天的内容，例如：聊天 你好")
-
-    try:
-        reply = await _call_gemini_text(prompt, state)
-        if not reply:
-            return
-        _append_history(
-            state,
-            "user",
-            prompt,
-            user_id=str(event.get_user_id()),
-            to_bot=True,
-        )
-        _append_history(state, "model", reply)
-        await chat_handler.finish(reply)
-    except FinishedException:
-        raise
-    except Exception as exc:
-        logger.error("Chat handler failed: {}", _safe_error_message(exc))
-        await chat_handler.finish(f"出错了：{_safe_error_message(exc)}")
+    await _handle_command_via_intent(
+        event,
+        text=f"聊天 {prompt}",
+        send_func=chat_handler.send,
+    )
 
 
 @weather_handler.handle()
 async def handle_weather(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
     query = args.extract_plain_text().strip()
-    try:
-        session_id = _session_id(event)
-        state = _get_state(session_id)
-        intent = {
-            "action": "weather",
-            "target": "city",
-            "instruction": query,
-            "params": {"city": query} if query else {},
-        }
-        normalized = _normalize_intent(intent, False, False, None, state)
-        if not normalized or not normalized.get("instruction"):
-            await weather_handler.finish("请提供城市或地区，例如：天气 北京")
-        await weather_handler.send("我看看喵")
-        messages = await _build_weather_messages(str(normalized.get("instruction")))
-        if not messages:
-            await weather_handler.finish("天气服务返回异常，请稍后再试。")
-        if len(messages) == 1:
-            await weather_handler.finish(messages[0])
-        for msg in messages[:-1]:
-            await weather_handler.send(msg)
-        await weather_handler.finish(messages[-1])
-    except FinishedException:
-        raise
-    except Exception as exc:
-        logger.error("Weather handler failed: {}", _safe_error_message(exc))
-        await weather_handler.finish(f"出错了：{_safe_error_message(exc)}")
+    if not query:
+        await weather_handler.finish("请提供城市或地区，例如：天气 北京")
+    await _handle_command_via_intent(
+        event,
+        text=f"天气 {query}",
+        send_func=weather_handler.send,
+    )
+
+
+@travel_handler.handle()
+async def handle_travel(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+    text = args.extract_plain_text().strip()
+    if not text:
+        await travel_handler.finish("请提供行程需求，例如：旅行规划 3天2晚 北京")
+    await _handle_command_via_intent(
+        event,
+        text=f"旅行规划 {text}",
+        send_func=travel_handler.send,
+    )
