@@ -62,6 +62,7 @@ _MD_HRULE = re.compile(r"^\s*([-*_]\s*){3,}$", re.M)
 _MD_LIST_MARKER = re.compile(r"^\s*(?:[-*+•·＊]|\d+[).、])\s*")
 _LINE_SPLIT_RE = re.compile(r"\r?\n+")
 _SENTENCE_SPLIT_RE = re.compile(r"([。！？!?；;])")
+_CLAUSE_SPLIT_RE = re.compile(r"([，,、；;])")
 
 _MODEL_REPLY_MAX_CHARS = 0
 _WAIT_NEXT_IMAGE_SEC = 60.0
@@ -75,7 +76,7 @@ _CHAT_SYSTEM_PROMPT = (
     "Rules\n"
     "1. 只当普通人，不要自称 AI/助手，也不要提系统或规则。\n"
     "2. 输出纯文本，不使用 Markdown 或代码块。\n"
-    "3. 适合 QQ 消息，精炼但不生硬；口语、简短，可自然换行；允许 2-4 句表达完整意思；少用句号，问号和感叹号克制。\n"
+    "3. 适合 QQ 消息\n"
     "4. 不要夸张表演，不堆流行语，不写长段解释。\n"
     "5. 不清楚就简短追问，不编造细节。\n"
     "6. 只回复当前消息，不要夹带已回复过的旧话题。\n"
@@ -87,7 +88,7 @@ _IMAGE_CHAT_SYSTEM_PROMPT = (
     "你现在是asoul成员嘉然，会尽量满足提问者的帮助。\n"
     "你在进行图片内容对话，只需回答当前指令或问题。\n"
     "不要补充已回复过的历史话题，不要输出 Markdown 或代码块。\n"
-    "回答适合 QQ 消息，精炼、不啰嗦，简短、口语化，可自然换行。\n"
+    "回答适合 QQ 消息，精炼、不啰嗦，简短、口语化，可自然换行；尽量用 2-3 句完整回答。\n"
 )
 
 _TRAVEL_SYSTEM_PROMPT = (
@@ -101,7 +102,7 @@ _TRAVEL_SYSTEM_PROMPT = (
 _INTENT_SYSTEM_PROMPT = (
     "你是消息意图解析器，只输出 JSON，不要解释或补充说明。"
     "不要输出拒绝/免责声明/权限说明（例如“我无法访问账号”）。"
-    "严格输出如下 JSON："
+    "只输出单一 JSON 对象，格式如下："
     "{"
     "\"action\": \"chat|image_chat|image_generate|image_create|weather|avatar_get|travel_plan|history_clear|ignore\","
     "\"target\": \"message_image|reply_image|at_user|last_image|sender_avatar|group_avatar|qq_avatar|message_id|wait_next|city|trip|none\","
@@ -109,34 +110,33 @@ _INTENT_SYSTEM_PROMPT = (
     "\"params\": {\"qq\": \"string\", \"message_id\": \"int\", \"city\": \"string\","
     " \"destination\": \"string\", \"days\": \"int\", \"nights\": \"int\", \"reply\": \"string\"}"
     "}"
-    "说明："
-    "- action=chat 表示普通聊天；instruction 为要回复的文本。"
-    "- action=image_chat 表示聊这张图（不生成图）；instruction 为想问/想说的内容。"
-    "- action=image_generate 表示基于参考图生成/编辑；instruction 为帮忙生成关于xx的图片的处理指令。"
-    "- action=image_create 表示无参考图生成；instruction 为生成指令。"
-    "- action=weather 表示查询天气；instruction 为地点，target=city，params.city 填地点。"
-    "- action=avatar_get 表示获取头像；instruction 可为空，target 可为 sender_avatar 或 group_avatar 等。"
-    "- action=travel_plan 表示旅行规划；instruction 为完整需求；target=trip；"
-    "params.destination 为目的地，params.days 为天数，params.nights 为晚数。"
-    "- action=history_clear 表示清除当前会话（当前聊天或群）历史记录；instruction 为空或简短确认。"
-    "- action=ignore 表示不处理；instruction 为空字符串。"
-    "- target 仅在 image_chat/image_generate 时使用："
-    "  message_image=本消息里的图；reply_image=回复消息里的图；"
-    "  at_user=@用户头像；last_image=最近图片；sender_avatar=发送者头像；group_avatar=群头像；"
-    "  qq_avatar=指定 QQ 头像（params.qq）；"
-    "  message_id=指定消息ID图片（params.message_id）；"
-    "  wait_next=等待下一张图；none=无参考图。"
-    "params 里只在对应 target 时填写："
-    "- target=qq_avatar 时填写 params.qq。"
-    "- target=message_id 时填写 params.message_id。"
-    "其他情况 params 为空对象。"
-    "若旅行或天气缺关键信息，仍输出对应 action，缺失字段留空。"
-    "上下文可能包含“昵称: 内容”的格式，需识别说话人。"
-    "如需发送等待/过渡语，可在 params.reply 中填写一句短句。"
-    " 如果文本包含多行，默认第一行是当前消息；只有当前消息无法判断时才参考后续上下文/回复内容。"
+    "规则："
+    "- 除 action=ignore 外，instruction 必须为非空字符串，填写当前用户原话或提炼后的指令。"
+    "- action=chat：普通聊天；target=none。"
+    "- action=image_chat：聊这张图（不生成图）；instruction 为问题/描述；。target 用于选图：message_image/reply_image/at_user/last_image/sender_avatar/group_avatar/qq_avatar/message_id/wait_next。"
+    "- action=image_generate：基于参考图生成/编辑；instruction 为处理指令。target 用于选图：message_image/reply_image/at_user/last_image/sender_avatar/group_avatar/qq_avatar/message_id/wait_next。"
+    "- action=image_create：无参考图生成；target=none。"
+    "- action=weather：查询天气；target=city；params.city 为地点（没有就留空）。"
+    "- action=avatar_get：获取头像；target 可为 sender_avatar/group_avatar/qq_avatar/at_user。"
+    "- action=travel_plan：旅行规划；target=trip；params.destination/days/nights 可填则填。"
+    "- action=history_clear：清除当前会话历史；target=none。"
+    "- action=ignore：不处理；instruction 为空字符串，target=none，params 为空对象。"
+    "- target=qq_avatar 时填写 params.qq；target=message_id 时填写 params.message_id。"
+    "- params 仅在对应 target/场景需要时填写，其余为空对象。"
+    "- 若旅行或天气缺关键信息，仍输出对应 action，缺失字段留空，instruction 仍填当前消息。"
+    "- 当需要调用第三方工具且可能耗时（如 weather、image_create、image_generate、image_chat、avatar_get、travel_plan）时，可在 params.reply 中给等待/过渡语。"
+    "- 若消息里 @ 多人，仍输出 target=at_user，系统会按顺序处理多个头像。"
+    "- 上下文可能包含“昵称: 内容”的格式，需识别说话人。"
 )
 
 _DUPLICATE_TEXT_TTL_SEC = 60.0
+_HISTORY_SUMMARY_ITEM_MAX_CHARS = 400
+
+_HISTORY_SUMMARY_SYSTEM_PROMPT = (
+    "你是对话摘要器，请将对话压缩成简短摘要。"
+    "保留关键信息、用户偏好、需求、结论与待办。"
+    "输出纯文本，不使用 Markdown、编号或引号。"
+)
 
 
 class UnsupportedImageError(RuntimeError):
@@ -294,6 +294,29 @@ def _split_sentences(text: str) -> List[str]:
     return [item for item in sentences if item]
 
 
+def _split_clauses(text: str) -> List[str]:
+    if not text:
+        return []
+    parts = _CLAUSE_SPLIT_RE.split(text)
+    clauses: List[str] = []
+    buffer = ""
+    for part in parts:
+        if not part:
+            continue
+        if _CLAUSE_SPLIT_RE.fullmatch(part):
+            buffer = f"{buffer}{part}"
+            if buffer.strip():
+                clauses.append(buffer.strip())
+            buffer = ""
+        else:
+            if buffer:
+                clauses.append(buffer.strip())
+            buffer = part
+    if buffer and buffer.strip():
+        clauses.append(buffer.strip())
+    return clauses
+
+
 def _forward_line_threshold() -> int:
     try:
         threshold = int(getattr(config, "forward_line_threshold", 0))
@@ -327,8 +350,11 @@ async def _send_text_response(
     if len(lines) <= _forward_line_threshold():
         sentences = _split_sentences(str(text))
         if len(sentences) <= 1:
-            await send_func(text)
-            return
+            clauses = _split_clauses(str(text))
+            if len(clauses) <= 1:
+                await send_func(text)
+                return
+            sentences = clauses
         delay = _message_send_delay_sec()
         for idx, sentence in enumerate(sentences):
             await send_func(sentence)
@@ -362,6 +388,7 @@ async def _send_text_response(
 
 
 def _transition_text(action: str) -> Optional[str]:
+    # 默认过渡语：耗时操作时给用户“正在处理”的提示
     if action in {"image_create"}:
         return "正在生成图片，请稍候..."
     if action in {"image_generate"}:
@@ -372,11 +399,20 @@ def _transition_text(action: str) -> Optional[str]:
 
 
 def _intent_transition_text(intent: dict) -> str:
+    # NLP 可选生成的过渡语（params.reply），有就用，没有就空字符串
     params = _intent_params(intent)
     reply = params.get("reply")
     if isinstance(reply, str):
         return reply.strip()
     return ""
+
+
+def _resolve_transition_text(action: str, intent: dict) -> Optional[str]:
+    # 优先使用 intent 给的过渡语，否则回退默认提示
+    reply = _intent_transition_text(intent)
+    if reply:
+        return reply
+    return _transition_text(action)
 
 
 async def _send_transition(action: str, send_func) -> None:
@@ -470,6 +506,7 @@ class HistoryItem:
     user_name: Optional[str] = None
     to_bot: bool = False
     message_id: Optional[int] = None
+    is_summary: bool = False
 
 
 @dataclass
@@ -480,6 +517,9 @@ class SessionState:
     pending_image_waiters: dict[str, asyncio.Future[str]]
     handled_message_ids: dict[int, float]
     handled_texts: dict[str, float]
+    history_lock: asyncio.Lock
+    summary_last_ts: float
+    summary_in_progress: bool
 
 
 _SESSIONS: dict[str, SessionState] = {}
@@ -513,6 +553,9 @@ def _get_state(session_id: str) -> SessionState:
             pending_image_waiters={},
             handled_message_ids={},
             handled_texts={},
+            history_lock=asyncio.Lock(),
+            summary_last_ts=0.0,
+            summary_in_progress=False,
         )
         _SESSIONS[session_id] = state
     return state
@@ -527,12 +570,234 @@ def _get_client() -> genai.Client:
     return _CLIENT
 
 
-def _prune_state(state: SessionState) -> None:
+def _history_compress_enabled() -> bool:
+    try:
+        return bool(getattr(config, "history_compress_enable", True))
+    except Exception:
+        return True
+
+
+def _history_reference_only() -> bool:
+    try:
+        return bool(getattr(config, "history_reference_only", True))
+    except Exception:
+        return True
+
+
+def _history_compress_trigger() -> int:
+    try:
+        value = int(getattr(config, "history_compress_trigger", 0))
+    except Exception:
+        value = 0
+    if value <= 0:
+        try:
+            base = int(getattr(config, "history_max_messages", 10))
+        except Exception:
+            base = 10
+        return max(16, base * 2)
+    return value
+
+
+def _history_compress_keep() -> int:
+    try:
+        value = int(getattr(config, "history_compress_keep", 0))
+    except Exception:
+        value = 0
+    if value <= 0:
+        return 6
+    return value
+
+
+def _history_compress_min_messages() -> int:
+    try:
+        value = int(getattr(config, "history_compress_min_messages", 0))
+    except Exception:
+        value = 0
+    if value <= 0:
+        return 6
+    return value
+
+
+def _history_compress_max_chars() -> int:
+    try:
+        value = int(getattr(config, "history_compress_max_chars", 0))
+    except Exception:
+        value = 0
+    if value <= 0:
+        return 600
+    return value
+
+
+def _history_hard_limit() -> int:
+    try:
+        base = int(getattr(config, "history_max_messages", 10))
+    except Exception:
+        base = 10
+    trigger = _history_compress_trigger()
+    return max(50, base * 5, trigger * 2)
+
+
+def _count_non_summary_items(items: List[HistoryItem]) -> int:
+    return sum(1 for item in items if not item.is_summary)
+
+
+def _history_item_label(item: HistoryItem) -> str:
+    if item.role == "model":
+        return item.user_name or _model_user_name()
+    if item.is_summary:
+        return item.user_name or "系统摘要"
+    return item.user_name or item.user_id or "用户"
+
+
+def _history_item_to_line(item: HistoryItem) -> str:
+    text = _ensure_plain_text(str(item.text))
+    if not text:
+        return ""
+    text = _truncate(text, _HISTORY_SUMMARY_ITEM_MAX_CHARS)
+    name = _history_item_label(item)
+    if name:
+        return f"{name}: {text}"
+    return text
+
+
+def _build_history_summary_input(items: List[HistoryItem]) -> str:
+    lines: List[str] = []
+    for item in items:
+        line = _history_item_to_line(item)
+        if line:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _build_history_reference_text(state: SessionState) -> str:
+    lines: List[str] = []
+    for item in state.history:
+        if item.is_summary:
+            line = _history_item_to_line(item)
+            if line:
+                lines.append(line)
+            continue
+        if item.role == "user" and not item.to_bot:
+            continue
+        line = _history_item_to_line(item)
+        if line:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _wrap_prompt_with_reference(
+    state: SessionState,
+    prompt: str,
+    *,
+    current_label: str,
+) -> str:
+    if not _history_reference_only():
+        return prompt
+    reference_text = _build_history_reference_text(state)
+    if not reference_text:
+        return prompt
+    return f"参考对话(仅供参考，不需要回复):\n{reference_text}\n\n{current_label}:\n{prompt}"
+
+
+async def _summarize_history_items(items: List[HistoryItem]) -> Optional[str]:
+    if not items:
+        return None
+    input_text = _build_history_summary_input(items)
+    if not input_text:
+        return None
+    max_chars = _history_compress_max_chars()
+    user_prompt = (
+        f"请总结以下对话记录，输出一段简短摘要，控制在{max_chars}字以内。\n"
+        f"对话记录:\n{input_text}"
+    )
+    client = _get_client()
+    config_obj, system_used = _build_generate_config(
+        system_instruction=_HISTORY_SUMMARY_SYSTEM_PROMPT
+    )
+    if _HISTORY_SUMMARY_SYSTEM_PROMPT and not system_used:
+        user_prompt = f"{_HISTORY_SUMMARY_SYSTEM_PROMPT}\n\n{user_prompt}"
+    response = await asyncio.wait_for(
+        client.aio.models.generate_content(
+            model=config.gemini_text_model,
+            contents=[types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)])],
+            config=config_obj,
+        ),
+        timeout=config.request_timeout,
+    )
+    if config.gemini_log_response:
+        logger.info("Gemini history summary response: {}", _dump_response(response))
+        _log_response_text("Gemini history summary content", response)
+    if response.text:
+        cleaned = _format_reply_text(response.text.strip())
+        cleaned = _compact_reply_lines(cleaned)
+        cleaned = _limit_reply_text(cleaned, max_chars)
+        return cleaned
+    text_parts: List[str] = []
+    for part in _iter_response_parts(response):
+        text_value = _extract_text_value(part)
+        if text_value:
+            text_parts.append(text_value)
+    cleaned = _format_reply_text("\n".join(text_parts).strip())
+    cleaned = _compact_reply_lines(cleaned)
+    cleaned = _limit_reply_text(cleaned, max_chars)
+    return cleaned
+
+
+async def _maybe_compress_history(state: SessionState) -> bool:
+    # 历史压缩：达到阈值时把旧记录摘要成一条“系统摘要”，保留最近若干条
+    if not _history_compress_enabled():
+        return False
+    if not config.google_api_key:
+        return False
+    if state.summary_in_progress:
+        return False
+    trigger = _history_compress_trigger()
+    if len(state.history) < trigger:
+        return False
+    keep = max(0, _history_compress_keep())
+    if keep >= len(state.history):
+        return False
+    compress_items = state.history[:-keep] if keep > 0 else list(state.history)
+    if _count_non_summary_items(compress_items) < _history_compress_min_messages():
+        return False
+    if not any(item.to_bot or item.role == "model" for item in compress_items):
+        return False
+    state.summary_in_progress = True
+    try:
+        summary = await _summarize_history_items(compress_items)
+    except Exception as exc:
+        logger.error("History summary failed: {}", _safe_error_message(exc))
+        return False
+    finally:
+        state.summary_in_progress = False
+    if not summary:
+        return False
+    ts = compress_items[-1].ts if compress_items else _now()
+    summary_item = HistoryItem(
+        role="user",
+        text=summary,
+        ts=ts,
+        user_name="系统摘要",
+        to_bot=True,
+        is_summary=True,
+    )
+    keep_items = state.history[-keep:] if keep > 0 else []
+    state.history = [summary_item, *keep_items]
+    state.summary_last_ts = _now()
+    return True
+
+
+def _prune_state(state: SessionState, *, trim_history: bool = True) -> None:
     ttl = max(30, int(config.history_ttl_sec))
     cutoff = _now() - ttl
     state.history = [item for item in state.history if item.ts >= cutoff]
-    if len(state.history) > config.history_max_messages:
-        state.history = state.history[-config.history_max_messages :]
+    hard_limit = _history_hard_limit()
+    if hard_limit > 0 and len(state.history) > hard_limit:
+        state.history = state.history[-hard_limit:]
+    if trim_history:
+        max_messages = max(1, int(config.history_max_messages))
+        if len(state.history) > max_messages:
+            state.history = state.history[-max_messages:]
     if state.image_cache:
         state.image_cache = {
             msg_id: (url, ts)
@@ -554,6 +819,8 @@ def _clear_session_state(state: SessionState) -> None:
     state.history = []
     state.last_image_url = None
     state.image_cache = {}
+    state.summary_last_ts = 0.0
+    state.summary_in_progress = False
     if state.pending_image_waiters:
         for waiter in state.pending_image_waiters.values():
             if not waiter.done():
@@ -619,13 +886,24 @@ def _extract_first_image_url(message: Message) -> Optional[str]:
     return None
 
 
-def _extract_at_user(message: Message) -> Optional[str]:
+def _extract_at_users(message: Message, self_id: Optional[object]) -> List[str]:
+    users: List[str] = []
+    seen: set[str] = set()
+    self_str = str(self_id) if self_id is not None else None
     for seg in message:
-        if seg.type == "at":
-            qq = seg.data.get("qq")
-            if qq and qq != "all":
-                return str(qq)
-    return None
+        if seg.type != "at":
+            continue
+        qq = seg.data.get("qq")
+        if not qq or qq == "all":
+            continue
+        qq_str = str(qq)
+        if self_str and qq_str == self_str:
+            continue
+        if qq_str in seen:
+            continue
+        seen.add(qq_str)
+        users.append(qq_str)
+    return users
 
 
 def _avatar_url(qq: str) -> str:
@@ -966,7 +1244,20 @@ def _extract_text_value(part: object) -> Optional[str]:
 
 async def _call_gemini_text(prompt: str, state: SessionState) -> str:
     client = _get_client()
-    contents = _history_to_gemini(state)
+    # 只回复当前消息：历史作为“参考文本”拼到当前指令里
+    if _history_reference_only():
+        prompt = _wrap_prompt_with_reference(state, prompt, current_label="当前消息")
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=prompt)],
+            )
+        ]
+    else:
+        contents = _history_to_gemini(state)
+        contents.append(
+            types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
+        )
     config_obj, system_used = _build_generate_config(system_instruction=_CHAT_SYSTEM_PROMPT)
     if _CHAT_SYSTEM_PROMPT and not system_used:
         contents.insert(
@@ -976,7 +1267,6 @@ async def _call_gemini_text(prompt: str, state: SessionState) -> str:
                 parts=[types.Part.from_text(text=_CHAT_SYSTEM_PROMPT)],
             ),
         )
-    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
     response = await asyncio.wait_for(
         client.aio.models.generate_content(
             model=config.gemini_text_model,
@@ -1024,9 +1314,21 @@ def _build_travel_prompt(intent: dict) -> str:
 
 async def _call_gemini_travel_plan(intent: dict, state: SessionState) -> str:
     client = _get_client()
-    contents = _history_to_gemini(state)
     prompt = _build_travel_prompt(intent)
-    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
+    # 只回复当前需求：历史作为参考文本
+    if _history_reference_only():
+        prompt = _wrap_prompt_with_reference(state, prompt, current_label="当前需求")
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=prompt)],
+            )
+        ]
+    else:
+        contents = _history_to_gemini(state)
+        contents.append(
+            types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
+        )
     config_obj, _ = _build_generate_config()
     response = await asyncio.wait_for(
         client.aio.models.generate_content(
@@ -1066,7 +1368,12 @@ async def _download_image_bytes(url: str) -> Tuple[str, bytes]:
 async def _call_gemini_image(prompt: str, image_url: str, state: SessionState) -> Tuple[bool, str]:
     client = _get_client()
     content_type, image_bytes = await _download_image_bytes(image_url)
-    contents = _history_to_gemini(state)
+    # 参考历史 + 当前指令 + 参考图，进行图片编辑
+    prompt = _wrap_prompt_with_reference(state, prompt, current_label="当前指令")
+    if _history_reference_only():
+        contents = []
+    else:
+        contents = _history_to_gemini(state)
     contents.append(
         types.Content(
             role="user",
@@ -1116,7 +1423,12 @@ async def _call_gemini_image(prompt: str, image_url: str, state: SessionState) -
 async def _call_gemini_image_chat(prompt: str, image_url: str, state: SessionState) -> str:
     client = _get_client()
     content_type, image_bytes = await _download_image_bytes(image_url)
-    contents = _history_to_gemini(state)
+    # 参考历史 + 当前指令 + 参考图，只要文本回答（聊图）
+    prompt = _wrap_prompt_with_reference(state, prompt, current_label="当前指令")
+    if _history_reference_only():
+        contents = []
+    else:
+        contents = _history_to_gemini(state)
     config_obj, system_used = _build_generate_config(
         system_instruction=_IMAGE_CHAT_SYSTEM_PROMPT,
         response_modalities=["TEXT"],
@@ -1165,8 +1477,20 @@ async def _call_gemini_image_chat(prompt: str, image_url: str, state: SessionSta
 
 async def _call_gemini_text_to_image(prompt: str, state: SessionState) -> Tuple[bool, str]:
     client = _get_client()
-    contents = _history_to_gemini(state)
-    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
+    # 只回复当前指令：可附带历史参考文本
+    prompt = _wrap_prompt_with_reference(state, prompt, current_label="当前指令")
+    if _history_reference_only():
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=prompt)],
+            )
+        ]
+    else:
+        contents = _history_to_gemini(state)
+        contents.append(
+            types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
+        )
     config_obj, _ = _build_generate_config(response_modalities=["IMAGE"])
     response = await asyncio.wait_for(
         client.aio.models.generate_content(
@@ -1214,7 +1538,7 @@ def _image_segment_from_result(result: str) -> MessageSegment:
     return MessageSegment.image(f"base64://{result}")
 
 
-def _append_history(
+async def _append_history(
     state: SessionState,
     role: str,
     text: str,
@@ -1225,20 +1549,23 @@ def _append_history(
     ts: Optional[float] = None,
     message_id: Optional[int] = None,
 ) -> None:
-    if role == "model" and not user_name:
-        user_name = _model_user_name()
-    state.history.append(
-        HistoryItem(
-            role=role,
-            text=text,
-            ts=_now() if ts is None else ts,
-            user_id=user_id,
-            user_name=user_name,
-            to_bot=to_bot,
-            message_id=message_id,
+    async with state.history_lock:
+        if role == "model" and not user_name:
+            user_name = _model_user_name()
+        state.history.append(
+            HistoryItem(
+                role=role,
+                text=text,
+                ts=_now() if ts is None else ts,
+                user_id=user_id,
+                user_name=user_name,
+                to_bot=to_bot,
+                message_id=message_id,
+            )
         )
-    )
-    _prune_state(state)
+        _prune_state(state, trim_history=False)
+        await _maybe_compress_history(state)
+        _prune_state(state)
 
 
 history_collector = on_message(priority=99, block=False)
@@ -1265,7 +1592,7 @@ async def _collect_history(event: MessageEvent):
 
     if text:
         user_name = _event_user_name(event)
-        _append_history(
+        await _append_history(
             state,
             "user",
             text,
@@ -1452,29 +1779,33 @@ async def _resolve_image_url(
 
 def _collect_context_messages(
     state: SessionState,
-    current_user_id: str,
     *,
     ts: float,
     limit: int,
     future: bool,
     current_text: str,
+    current_message_id: Optional[int],
 ) -> List[str]:
     if limit <= 0:
         return []
     texts: List[str] = []
     items = state.history if future else reversed(state.history)
     for item in items:
-        if item.role != "user":
+        if item.role not in {"user", "model"}:
             continue
-        if not item.to_bot:
+        if item.role == "user" and not item.to_bot:
             continue
         if future and item.ts <= ts:
             continue
         if not future and item.ts > ts:
             continue
-        if item.text == current_text and item.user_id == current_user_id:
+        if current_message_id is not None and item.message_id == current_message_id:
             continue
-        line = _format_context_line(item.text, item.user_name or item.user_id)
+        if item.role == "model":
+            name = item.user_name or _model_user_name()
+        else:
+            name = item.user_name or item.user_id
+        line = _format_context_line(item.text, name)
         texts.append(line)
         if len(texts) >= limit:
             break
@@ -1529,16 +1860,17 @@ async def _build_intent_text(
         wait_sec = 1.0
 
     ts = _event_ts(event)
-    user_id = str(event.get_user_id())
+    current_name = _event_user_name(event)
+    current_message_id = getattr(event, "message_id", None)
     reply_text, reply_name = _extract_reply_context(event, state)
 
     prev_texts = _collect_context_messages(
         state,
-        user_id,
         ts=ts,
         limit=max_prev,
         future=False,
         current_text=text,
+        current_message_id=current_message_id if isinstance(current_message_id, int) else None,
     )
     future_texts: List[str] = []
     if max_future > 0:
@@ -1546,11 +1878,11 @@ async def _build_intent_text(
             await asyncio.sleep(wait_sec)
         future_texts = _collect_context_messages(
             state,
-            user_id,
             ts=ts,
             limit=max_future,
             future=True,
             current_text=text,
+            current_message_id=current_message_id if isinstance(current_message_id, int) else None,
         )
 
     reply_line = ""
@@ -1562,11 +1894,11 @@ async def _build_intent_text(
         )
     combined = [
         part
-        for part in [text, reply_line, *prev_texts, *future_texts]
+        for part in [_format_context_line(text, current_name), reply_line, *prev_texts, *future_texts]
         if part
     ]
     if not combined:
-        return text
+        return _format_context_line(text, current_name)
     return "\n".join(combined)
 
 
@@ -1575,17 +1907,18 @@ def _build_primary_intent_text(
     state: SessionState,
     text: str,
 ) -> str:
+    current_name = _event_user_name(event)
     reply_text, reply_name = _extract_reply_context(event, state)
     if not reply_text:
-        return text
+        return _format_context_line(text, current_name)
     if reply_text.strip() == text.strip():
-        return text
+        return _format_context_line(text, current_name)
     reply_line = (
         _format_context_line(reply_text, reply_name)
         if reply_name
         else f"回复内容: {reply_text}"
     )
-    return "\n".join([text, reply_line])
+    return "\n".join([_format_context_line(text, current_name), reply_line])
 
 
 _ALLOWED_ACTIONS = {
@@ -1625,7 +1958,7 @@ def _normalize_intent(
     intent: Optional[dict],
     has_image: bool,
     has_reply_image: bool,
-    at_user: Optional[str],
+    at_users: List[str],
     state: SessionState,
 ) -> Optional[dict]:
     if not isinstance(intent, dict):
@@ -1657,7 +1990,7 @@ def _normalize_intent(
                 target = "message_image"
             elif has_reply_image:
                 target = "reply_image"
-            elif at_user:
+            elif at_users:
                 target = "at_user"
             elif state.last_image_url:
                 target = "last_image"
@@ -1751,7 +2084,7 @@ async def _build_travel_plan_reply(
     if cleaned_instruction and cleaned_instruction not in summary:
         summary = f"{summary} 需求:{cleaned_instruction}"
     user_name = _event_user_name(event)
-    _append_history(
+    await _append_history(
         state,
         "user",
         f"旅行规划：{summary}",
@@ -1759,7 +2092,7 @@ async def _build_travel_plan_reply(
         user_name=user_name,
         to_bot=True,
     )
-    _append_history(state, "model", reply)
+    await _append_history(state, "model", reply)
     return reply
 
 
@@ -1772,21 +2105,24 @@ async def _dispatch_intent(
     *,
     image_url: Optional[str],
     reply_image_url: Optional[str],
-    at_user: Optional[str],
+    at_users: List[str],
     send_func,
 ) -> None:
+    # 意图分发：按 action 走不同处理链路
     action = str(intent.get("action", "ignore")).lower()
     if action == "ignore":
         return
     user_name = _event_user_name(event)
+    at_user = at_users[0] if at_users else None
 
     if action == "chat":
+        # 普通聊天（文本）
         prompt = intent.get("instruction")
         try:
             reply = await _call_gemini_text(str(prompt), state)
             if not reply:
                 return
-            _append_history(
+            await _append_history(
                 state,
                 "user",
                 str(prompt),
@@ -1794,7 +2130,7 @@ async def _dispatch_intent(
                 user_name=user_name,
                 to_bot=True,
             )
-            _append_history(state, "model", reply)
+            await _append_history(state, "model", reply)
             await _send_text_response(bot, event, send_func, reply)
             _mark_handled_request(state, event, text)
         except Exception as exc:
@@ -1802,6 +2138,7 @@ async def _dispatch_intent(
         return
 
     if action == "weather":
+        # 天气查询
         query = str(intent.get("instruction") or "").strip()
         if not query:
             await send_func("请告诉我城市或地区，例如：天气 北京")
@@ -1812,7 +2149,7 @@ async def _dispatch_intent(
             if not messages:
                 return
             reply_text = "\n".join(messages)
-            _append_history(
+            await _append_history(
                 state,
                 "user",
                 f"天气：{query}",
@@ -1820,7 +2157,7 @@ async def _dispatch_intent(
                 user_name=user_name,
                 to_bot=True,
             )
-            _append_history(state, "model", reply_text)
+            await _append_history(state, "model", reply_text)
             for msg in messages:
                 await send_func(msg)
             _mark_handled_request(state, event, text)
@@ -1830,6 +2167,7 @@ async def _dispatch_intent(
         return
 
     if action == "travel_plan":
+        # 旅行规划
         params = _intent_params(intent)
         destination = params.get("destination")
         if not isinstance(destination, str) or not destination.strip():
@@ -1848,17 +2186,24 @@ async def _dispatch_intent(
         return
 
     if action == "history_clear":
+        # 清空当前会话历史
         _clear_session_state(state)
         await send_func("已清除当前会话记录，可以继续聊啦。")
         return
 
     if action == "avatar_get":
+        # 获取头像（发送者/群/指定QQ等）
         target = str(intent.get("target") or "").lower()
         params = _intent_params(intent)
         if target == "qq_avatar" and not params.get("qq"):
             await send_func("请提供 QQ 号。")
             return
         await _send_transition(action, send_func)
+        if target == "at_user" and len(at_users) > 1:
+            for qq in at_users:
+                await send_func(_image_segment_from_result(_avatar_url(qq)))
+            _mark_handled_request(state, event, text)
+            return
         image_url = await _resolve_image_url(
             intent,
             event=event,
@@ -1879,12 +2224,13 @@ async def _dispatch_intent(
     params = _intent_params(intent)
 
     if action == "image_create":
-        transition_text = _intent_transition_text(intent)
+        # 无参考图的图片生成
+        transition_text = _resolve_transition_text(action, intent)
         if transition_text:
             await send_func(transition_text)
         try:
             is_image, result = await _call_gemini_text_to_image(prompt, state)
-            _append_history(
+            await _append_history(
                 state,
                 "user",
                 f"生成图片：{prompt}",
@@ -1893,12 +2239,11 @@ async def _dispatch_intent(
                 to_bot=True,
             )
             if is_image:
-                _append_history(state, "model", "[已生成图片]")
-                await send_func("已生成图片。")
+                await _append_history(state, "model", "[已生成图片]")
                 await send_func(_image_segment_from_result(result))
                 _mark_handled_request(state, event, text)
             else:
-                _append_history(state, "model", result)
+                await _append_history(state, "model", result)
                 await send_func(f"生成结果：{result}")
                 _mark_handled_request(state, event, text)
         except Exception as exc:
@@ -1918,6 +2263,63 @@ async def _dispatch_intent(
     if target == "wait_next":
         await send_func("请在60秒内发送图片。")
 
+    if target == "at_user" and len(at_users) > 1:
+        if action == "image_chat":
+            try:
+                await _send_transition(action, send_func)
+                for qq in at_users:
+                    avatar_url = _avatar_url(qq)
+                    reply = await _call_gemini_image_chat(prompt, avatar_url, state)
+                    if not reply:
+                        continue
+                    await _append_history(
+                        state,
+                        "user",
+                        f"聊图({qq})：{prompt}",
+                        user_id=str(event.get_user_id()),
+                        user_name=user_name,
+                        to_bot=True,
+                    )
+                    await _append_history(state, "model", reply)
+                    await send_func(f"QQ {qq}：{reply}")
+                _mark_handled_request(state, event, text)
+            except UnsupportedImageError:
+                await send_func("这个格式我处理不了，发张静态图吧。")
+            except Exception as exc:
+                logger.error("NLP image chat failed: {}", _safe_error_message(exc))
+                await send_func(f"出错了：{_safe_error_message(exc)}")
+            return
+        if action == "image_generate":
+            try:
+                transition_text = _resolve_transition_text(action, intent)
+                if transition_text:
+                    await send_func(transition_text)
+                for qq in at_users:
+                    avatar_url = _avatar_url(qq)
+                    is_image, result = await _call_gemini_image(prompt, avatar_url, state)
+                    await _append_history(
+                        state,
+                        "user",
+                        f"处理头像({qq})：{prompt}",
+                        user_id=str(event.get_user_id()),
+                        user_name=user_name,
+                        to_bot=True,
+                    )
+                    if is_image:
+                        await _append_history(state, "model", "[已生成图片]")
+                        await send_func(f"QQ {qq} 已完成修改。")
+                        await send_func(_image_segment_from_result(result))
+                    else:
+                        await _append_history(state, "model", result)
+                        await send_func(f"QQ {qq} 修改结果：{result}")
+                _mark_handled_request(state, event, text)
+            except UnsupportedImageError:
+                await send_func("这个格式我处理不了，发张静态图吧。")
+            except Exception as exc:
+                logger.error("NLP image failed: {}", _safe_error_message(exc))
+                await send_func(f"出错了：{_safe_error_message(exc)}")
+            return
+
     image_url = await _resolve_image_url(
         intent,
         event=event,
@@ -1931,12 +2333,13 @@ async def _dispatch_intent(
         return
 
     if action == "image_chat":
+        # 聊图：有参考图，仅文本回答
         try:
             await _send_transition(action, send_func)
             reply = await _call_gemini_image_chat(prompt, image_url, state)
             if not reply:
                 return
-            _append_history(
+            await _append_history(
                 state,
                 "user",
                 f"聊图：{prompt}",
@@ -1944,7 +2347,7 @@ async def _dispatch_intent(
                 user_name=user_name,
                 to_bot=True,
             )
-            _append_history(state, "model", reply)
+            await _append_history(state, "model", reply)
             await _send_text_response(bot, event, send_func, reply)
             _mark_handled_request(state, event, text)
         except UnsupportedImageError:
@@ -1955,11 +2358,12 @@ async def _dispatch_intent(
         return
 
     try:
-        transition_text = _intent_transition_text(intent)
+        # 处理头像/图片：有参考图，可能返回图片或文本
+        transition_text = _resolve_transition_text(action, intent)
         if transition_text:
             await send_func(transition_text)
         is_image, result = await _call_gemini_image(prompt, image_url, state)
-        _append_history(
+        await _append_history(
             state,
             "user",
             f"处理头像：{prompt}",
@@ -1968,12 +2372,11 @@ async def _dispatch_intent(
             to_bot=True,
         )
         if is_image:
-            _append_history(state, "model", "[已生成图片]")
-            await send_func("已完成修改。")
+            await _append_history(state, "model", "[已修改图片]")
             await send_func(_image_segment_from_result(result))
             _mark_handled_request(state, event, text)
         else:
-            _append_history(state, "model", result)
+            await _append_history(state, "model", result)
             await send_func(f"修改结果：{result}")
             _mark_handled_request(state, event, text)
     except UnsupportedImageError:
@@ -2106,7 +2509,7 @@ async def _classify_intent(
     state: SessionState,
     has_image: bool,
     has_reply_image: bool,
-    at_user: Optional[str],
+    at_users: List[str],
 ) -> Optional[dict]:
     if not config.google_api_key:
         return None
@@ -2116,7 +2519,7 @@ async def _classify_intent(
         f"文本: {text}\n"
         f"消息包含图片: {has_image}\n"
         f"回复里有图片: {has_reply_image}\n"
-        f"是否@用户: {bool(at_user)}\n"
+        f"是否@用户: {bool(at_users)}\n"
         f"是否有最近图片: {bool(state.last_image_url)}\n"
     )
     config_obj, system_used = _build_generate_config(
@@ -2161,7 +2564,7 @@ async def _handle_natural_language(bot: Bot, event: MessageEvent):
     if _is_duplicate_request(state, event, text):
         return
     image_url = _extract_first_image_url(event.get_message())
-    at_user = _extract_at_user(event.get_message())
+    at_users = _extract_at_users(event.get_message(), event.self_id)
     reply_image_url = _extract_reply_image_url(event, state)
     has_image = image_url is not None
     has_reply_image = reply_image_url is not None
@@ -2169,22 +2572,22 @@ async def _handle_natural_language(bot: Bot, event: MessageEvent):
     try:
         primary_text = _build_primary_intent_text(event, state, text)
         intent_raw = await _classify_intent(
-            primary_text, state, has_image, has_reply_image, at_user
+            primary_text, state, has_image, has_reply_image, at_users
         )
     except Exception as exc:
         logger.error("Intent classify failed: {}", _safe_error_message(exc))
         return
 
-    intent = _normalize_intent(intent_raw, has_image, has_reply_image, at_user, state)
+    intent = _normalize_intent(intent_raw, has_image, has_reply_image, at_users, state)
     if not intent:
         try:
             intent_text = await _build_intent_text(event, state, text)
             if intent_text and intent_text != primary_text:
                 intent_raw = await _classify_intent(
-                    intent_text, state, has_image, has_reply_image, at_user
+                    intent_text, state, has_image, has_reply_image, at_users
                 )
                 intent = _normalize_intent(
-                    intent_raw, has_image, has_reply_image, at_user, state
+                    intent_raw, has_image, has_reply_image, at_users, state
                 )
         except Exception as exc:
             logger.error("Intent classify failed: {}", _safe_error_message(exc))
@@ -2205,7 +2608,7 @@ async def _handle_natural_language(bot: Bot, event: MessageEvent):
         text,
         image_url=image_url,
         reply_image_url=reply_image_url,
-        at_user=at_user,
+        at_users=at_users,
         send_func=nlp_handler.send,
     )
 
@@ -2223,19 +2626,19 @@ async def _handle_command_via_intent(
     session_id = _session_id(event)
     state = _get_state(session_id)
     image_url = _extract_first_image_url(event.get_message())
-    at_user = _extract_at_user(event.get_message())
+    at_users = _extract_at_users(event.get_message(), event.self_id)
     reply_image_url = _extract_reply_image_url(event, state)
     has_image = image_url is not None
     has_reply_image = reply_image_url is not None
     try:
         intent_raw = await _classify_intent(
-            text, state, has_image, has_reply_image, at_user
+            text, state, has_image, has_reply_image, at_users
         )
     except Exception as exc:
         logger.error("Intent classify failed: {}", _safe_error_message(exc))
         await send_func("意图解析失败，请稍后再试。")
         return
-    intent = _normalize_intent(intent_raw, has_image, has_reply_image, at_user, state)
+    intent = _normalize_intent(intent_raw, has_image, has_reply_image, at_users, state)
     if not intent:
         await send_func(_clarify_intent_text(has_image))
         return
@@ -2251,7 +2654,7 @@ async def _handle_command_via_intent(
         text,
         image_url=image_url,
         reply_image_url=reply_image_url,
-        at_user=at_user,
+        at_users=at_users,
         send_func=send_func,
     )
 
