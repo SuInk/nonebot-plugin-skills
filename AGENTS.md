@@ -6,8 +6,8 @@ description: Agent instructions for this repo
 # Agent Rules
 
 ## 必须遵守
-- 所有新增或修改的功能，必须先经过自然语言处理（NLP）得到结构化 JSON，再由 JSON 驱动工具调用完成处理。
-- 不允许直接在业务逻辑中根据原始文本执行具体操作；必须走“解析 -> JSON -> 工具调度”的链路。
+- 所有新增或修改的功能，必须先经过自然语言处理（NLP）得到结构化 JSON，先由 JSON 明确 action/target/params，再进入业务逻辑处理。
+- JSON解析完意图后，可直接在业务逻辑中根据原始文本执行具体操作；
 - 发送给 QQ 的输出必须为纯文本，不使用 Markdown 格式。
 
 ## JSON 规范（建议）
@@ -16,7 +16,6 @@ description: Agent instructions for this repo
 {
   "action": "string",          // 动作类型，例如: chat, image, weather, ignore
   "target": "string",          // 目标类型或资源，例如: message_image, city, user
-  "instruction": "string",     // 用户意图的自然语言指令或补充信息
   "params": { ... }            // 结构化参数，可选
 }
 ```

@@ -14,16 +14,21 @@ class Config(BaseModel):
     image_timeout: float = 120.0
     history_ttl_sec: int = 600
     history_max_messages: int = 10
+    image_cache_max_images: int = 10
     history_compress_enable: bool = True
     history_compress_trigger: int = 20
     history_compress_keep: int = 6
     history_compress_min_messages: int = 6
     history_compress_max_chars: int = 600
     history_reference_only: bool = True
+    forward_char_threshold: int = 100
     forward_line_threshold: int = 8
     message_send_delay_sec: float = 0.6
     gemini_log_response: bool = False
     nlp_enable: bool = True
+    nlp_context_history_messages: int = 2
+    nlp_context_future_messages: int = 2
+    nlp_context_future_wait_sec: float = 1.0
     bot_keywords: List[str] = []
 
 
