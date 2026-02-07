@@ -164,7 +164,7 @@ _TRAVEL_SYSTEM_PROMPT = (
     "结构清晰，可自然换行，尽量不要空行，包含景点/活动/用餐/交通/住宿/注意事项等要点。\n"
     "请自动生成该城市最常见的规划天数。\n"
     "Output\n"
-    "只输出最终回复内容。\n"
+    "只输出最终回复内容，可自然换行。\n"
 )
 
 _WEB_SUMMARY_SYSTEM_PROMPT = (
@@ -176,7 +176,7 @@ _WEB_SUMMARY_SYSTEM_PROMPT = (
     "信息不足时明确说明，不要编造。\n"
     "语言简洁，适合 QQ 消息。\n"
     "Output\n"
-    "只输出最终回复内容。\n"
+    "只输出最终回复内容，可自然换行。\n"
 )
 
 _INTENT_SYSTEM_PROMPT = (
