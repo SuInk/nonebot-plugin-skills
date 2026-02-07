@@ -75,6 +75,7 @@ _DEFAULT_WEB_EXTRACT_MAX_CHARS = 12000
 
 _WEB_SUMMARY_HOST_LABELS = {
     "github.com": "GitHub",
+    "raw.githubusercontent.com": "GitHub",
     "v2ex.com": "V2EX",
     "linux.do": "LinuxDo",
     "news.ycombinator.com": "Hacker News",
@@ -88,7 +89,7 @@ _WEB_SUMMARY_HOST_LABELS = {
 _WEB_SUMMARY_ALLOWED_ROOT_HOSTS = tuple(_WEB_SUMMARY_HOST_LABELS.keys())
 _WEB_SUMMARY_BARE_HOST_PATTERN = (
     r"(?:[a-zA-Z0-9-]+\.)*"
-    r"(?:github\.com|v2ex\.com|linux\.do|news\.ycombinator\.com|hackernews\.com|"
+    r"(?:github\.com|raw\.githubusercontent\.com|v2ex\.com|linux\.do|news\.ycombinator\.com|hackernews\.com|"
     r"bilibili\.com|b23\.tv|zhihu\.com|x\.com|twitter\.com)"
 )
 _URL_IN_TEXT_RE = re.compile(
@@ -132,8 +133,6 @@ _WEB_SITE_BLOCK_PATTERNS = {
         re.compile(r"<table[^>]*class=[\"'][^\"']*itemlist[^\"']*[\"'][^>]*>(.*?)</table>", re.I | re.S),
     ),
 }
-_WEB_SUMMARY_SITES_TEXT = "GitHub、V2EX、LinuxDo、Hacker News、Bilibili、知乎、X"
-
 _CHAT_SYSTEM_PROMPT = (
     "Role\n"
     "你是asoul成员嘉然，会尽量满足提问者的帮助，正在和朋友私聊或群聊。\n\n"
@@ -156,7 +155,7 @@ _IMAGE_CHAT_SYSTEM_PROMPT = (
 
 _TRAVEL_SYSTEM_PROMPT = (
     "Role\n"
-    "你是旅行规划助手，给出清晰、实用、可执行的旅行建议。\n"
+    "你是旅行规划助手和asoul成员嘉然，给出清晰、实用、可执行的旅行建议。\n"
     "Goal\n"
     "根据对方消息给出自然、真实、适合 QQ 消息的回复。\n\n"
     "Rules\n"
@@ -170,7 +169,7 @@ _TRAVEL_SYSTEM_PROMPT = (
 
 _WEB_SUMMARY_SYSTEM_PROMPT = (
     "Role\n"
-    "你是网页总结助手，负责总结网页正文。\n\n"
+    "你是网页总结助手和asoul成员嘉然，负责总结网页正文。\n\n"
     "Rules\n"
     "输出纯文本，不使用 Markdown 或代码块。\n"
     "先给重点结论，再给关键细节。\n"
@@ -632,8 +631,6 @@ def _transition_text(action: str) -> Optional[str]:
         return "正在生成图片，请稍候..."
     if action in {"image_generate"}:
         return "正在处理图片，请稍候..."
-    if action in {"web_summary"}:
-        return "正在抓取网页并总结，请稍候..."
     return None
 
 
@@ -936,16 +933,47 @@ def _normalize_web_summary_url(raw_url: str) -> Optional[str]:
     return normalized
 
 
-def _web_summary_help_message() -> str:
-    return (
-        "请提供要总结的网页链接，例如：网页总结 https://github.com/owner/repo，"
-        f"支持{_WEB_SUMMARY_SITES_TEXT}。"
-    )
-
-
 def _web_summary_source_label(url: str) -> str:
     parsed = urlsplit(url or "")
     return _web_summary_site_name(parsed.hostname or "") or "网页"
+
+
+def _resolve_web_summary_url(intent: dict, raw_text: str) -> str:
+    params = _intent_params(intent)
+    raw_url = params.get("url")
+    url = raw_url.strip() if isinstance(raw_url, str) else ""
+    if not url:
+        url = _extract_first_url(raw_text) or ""
+    return _normalize_web_summary_url(url) or ""
+
+
+def _rewrite_github_blob_url_for_fetch(url: str) -> str:
+    parsed = urlsplit(url or "")
+    if _web_summary_root_host(parsed.hostname or "") != "github.com":
+        return url
+    path = parsed.path or ""
+    marker = "/blob/"
+    if marker not in path:
+        return url
+    rewritten_path = path.replace(marker, "/raw/", 1)
+    return urlunsplit((parsed.scheme, parsed.netloc, rewritten_path, parsed.query, ""))
+
+
+def _extract_plain_page_text(text: str) -> str:
+    if not text:
+        return ""
+    lines: List[str] = []
+    for raw_line in text.splitlines():
+        line = _collapse_spaces(raw_line)
+        if line:
+            lines.append(line)
+    cleaned = "\n".join(lines).strip()
+    if not cleaned:
+        return ""
+    limit = _web_extract_max_chars()
+    if len(cleaned) > limit:
+        cleaned = cleaned[:limit].rstrip() + "\n[内容已截断]"
+    return cleaned
 
 
 def _normalize_github_url(raw_url: str) -> Optional[str]:
@@ -2016,6 +2044,7 @@ def _extract_web_page_text(html_text: str, *, host: str = "") -> str:
 async def _fetch_web_page_text(url: str) -> str:
     client = _get_http_client()
     max_bytes = _web_fetch_max_bytes()
+    request_url = _rewrite_github_blob_url_for_fetch(url)
     headers = {
         "User-Agent": "nonebot-plugin-skills/1.0",
         "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1",
@@ -2027,7 +2056,7 @@ async def _fetch_web_page_text(url: str) -> str:
     source_host = ""
     async with client.stream(
         "GET",
-        url,
+        request_url,
         headers=headers,
         timeout=_request_timeout_seconds(),
     ) as resp:
@@ -2052,10 +2081,13 @@ async def _fetch_web_page_text(url: str) -> str:
     if not data:
         raise RuntimeError("网页内容为空")
     try:
-        html_text = data.decode(encoding, errors="ignore")
+        decoded_text = data.decode(encoding, errors="ignore")
     except LookupError:
-        html_text = data.decode("utf-8", errors="ignore")
-    text = _extract_web_page_text(html_text, host=source_host)
+        decoded_text = data.decode("utf-8", errors="ignore")
+    if "text/plain" in content_type:
+        text = _extract_plain_page_text(decoded_text)
+    else:
+        text = _extract_web_page_text(decoded_text, host=source_host)
     if not text:
         raise RuntimeError("未提取到可读正文")
     return text
@@ -2164,18 +2196,11 @@ async def _build_web_summary_reply(
     event: MessageEvent,
     *,
     raw_text: str,
-) -> str:
-    params = _intent_params(intent)
-    raw_url = params.get("url")
-    url = raw_url.strip() if isinstance(raw_url, str) else ""
-    if not url:
-        url = _extract_first_url(raw_text) or ""
-    normalized_url = _normalize_web_summary_url(url)
+) -> Optional[str]:
+    normalized_url = _resolve_web_summary_url(intent, raw_text)
     if not normalized_url:
-        return (
-            f"目前支持{_WEB_SUMMARY_SITES_TEXT}链接，"
-            "请发送完整 URL。"
-        )
+        return None
+    params = _intent_params(intent)
     focus_raw = params.get("focus")
     focus = focus_raw.strip() if isinstance(focus_raw, str) else ""
     if not focus:
@@ -3341,7 +3366,9 @@ async def _dispatch_intent(
         if not raw_text:
             raw_text = raw_message_text.strip()
         if not raw_text:
-            await send_func(_web_summary_help_message())
+            return
+        normalized_url = _resolve_web_summary_url(intent, raw_text)
+        if not normalized_url:
             return
         if not transition_sent:
             await _send_transition(action, send_func)
@@ -3949,7 +3976,7 @@ async def handle_travel(bot: Bot, event: MessageEvent, args: Message = CommandAr
 async def handle_web_summary(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
     query = args.extract_plain_text().strip()
     if not query:
-        await web_summary_handler.finish(_web_summary_help_message())
+        return
     await _handle_command_via_intent(
         bot,
         event,
