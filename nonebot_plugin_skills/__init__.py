@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
 import json
 import re
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, cast
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from google import genai
@@ -20,8 +22,8 @@ from .config import config
 
 __plugin_meta__ = PluginMetadata(
     name="nonebot-plugin-skills",
-    description="基于 Gemini 的头像/图片处理与聊天插件，支持上下文缓存与群/私聊隔离",
-    usage="指令：处理头像 <指令> / 技能|聊天 <内容> / 天气 <城市>",
+    description="基于 Gemini 的头像/图片处理、聊天与网页总结插件，支持上下文缓存与群/私聊隔离",
+    usage="指令：处理头像 <指令> / 技能|聊天 <内容> / 天气 <城市> / 网页总结 <网页链接>",
     type="application",
     homepage="https://github.com/yourname/nonebot-plugin-skills",
     supported_adapters={"~onebot.v11"},
@@ -67,6 +69,70 @@ _MODEL_REPLY_MAX_CHARS = 0
 _WAIT_NEXT_IMAGE_SEC = 60.0
 _IMAGE_CACHE_REF_PREFIX = "cache:"
 _IMAGE_CACHE_MAX_BYTES = 8 * 1024 * 1024
+_DEFAULT_IMAGE_DOWNLOAD_MAX_BYTES = 15 * 1024 * 1024
+_DEFAULT_WEB_FETCH_MAX_BYTES = 2 * 1024 * 1024
+_DEFAULT_WEB_EXTRACT_MAX_CHARS = 12000
+
+_WEB_SUMMARY_HOST_LABELS = {
+    "github.com": "GitHub",
+    "v2ex.com": "V2EX",
+    "linux.do": "LinuxDo",
+    "news.ycombinator.com": "Hacker News",
+    "hackernews.com": "Hacker News",
+    "bilibili.com": "Bilibili",
+    "b23.tv": "Bilibili",
+    "zhihu.com": "知乎",
+    "x.com": "X",
+    "twitter.com": "X",
+}
+_WEB_SUMMARY_ALLOWED_ROOT_HOSTS = tuple(_WEB_SUMMARY_HOST_LABELS.keys())
+_WEB_SUMMARY_BARE_HOST_PATTERN = (
+    r"(?:[a-zA-Z0-9-]+\.)*"
+    r"(?:github\.com|v2ex\.com|linux\.do|news\.ycombinator\.com|hackernews\.com|"
+    r"bilibili\.com|b23\.tv|zhihu\.com|x\.com|twitter\.com)"
+)
+_URL_IN_TEXT_RE = re.compile(
+    rf"(https?://[^\s<>{{}}\"'|\\^`]+|{_WEB_SUMMARY_BARE_HOST_PATTERN}(?:/[^\s<>{{}}\"'|\\^`]*)?)",
+    re.I,
+)
+_URL_TRAILING_PUNCT = " \t\r\n,.;:!?)]}>\"'，。；：！？）】》"
+_URL_LEADING_PUNCT = " \t\r\n<([{\"'（【《"
+
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+_HTML_DROP_BLOCK_RE = re.compile(
+    r"<(script|style|noscript|svg|iframe|canvas)[^>]*>.*?</\1>",
+    re.I | re.S,
+)
+_HTML_BLOCK_TAG_RE = re.compile(
+    r"</?(?:p|div|section|article|main|header|footer|aside|li|tr|h[1-6]|pre|blockquote|br)[^>]*>",
+    re.I,
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+_WEB_COMMON_BLOCK_PATTERNS = (
+    re.compile(r"<article[^>]*>(.*?)</article>", re.I | re.S),
+    re.compile(r"<div[^>]*role=[\"']main[\"'][^>]*>(.*?)</div>", re.I | re.S),
+    re.compile(r"<div[^>]*id=[\"']readme[\"'][^>]*>(.*?)</div>", re.I | re.S),
+    re.compile(r"<main[^>]*>(.*?)</main>", re.I | re.S),
+)
+_WEB_SITE_BLOCK_PATTERNS = {
+    "github.com": (
+        re.compile(r"<article[^>]*>(.*?)</article>", re.I | re.S),
+        re.compile(r"<div[^>]*id=[\"']readme[\"'][^>]*>(.*?)</div>", re.I | re.S),
+        re.compile(r"<main[^>]*>(.*?)</main>", re.I | re.S),
+    ),
+    "v2ex.com": (
+        re.compile(r"<div[^>]*id=[\"']Main[\"'][^>]*>(.*?)</div>", re.I | re.S),
+    ),
+    "linux.do": (
+        re.compile(r"<article[^>]*class=[\"'][^\"']*topic-post[^\"']*[\"'][^>]*>(.*?)</article>", re.I | re.S),
+        re.compile(r"<div[^>]*class=[\"'][^\"']*topic-body[^\"']*[\"'][^>]*>(.*?)</div>", re.I | re.S),
+    ),
+    "news.ycombinator.com": (
+        re.compile(r"<table[^>]*class=[\"'][^\"']*itemlist[^\"']*[\"'][^>]*>(.*?)</table>", re.I | re.S),
+    ),
+}
+_WEB_SUMMARY_SITES_TEXT = "GitHub、V2EX、LinuxDo、Hacker News、Bilibili、知乎、X"
 
 _CHAT_SYSTEM_PROMPT = (
     "Role\n"
@@ -102,15 +168,28 @@ _TRAVEL_SYSTEM_PROMPT = (
     "只输出最终回复内容。\n"
 )
 
+_WEB_SUMMARY_SYSTEM_PROMPT = (
+    "Role\n"
+    "你是网页总结助手，负责总结网页正文。\n\n"
+    "Rules\n"
+    "输出纯文本，不使用 Markdown 或代码块。\n"
+    "先给重点结论，再给关键细节。\n"
+    "信息不足时明确说明，不要编造。\n"
+    "语言简洁，适合 QQ 消息。\n"
+    "Output\n"
+    "只输出最终回复内容。\n"
+)
+
 _INTENT_SYSTEM_PROMPT = (
     "你是消息意图解析器，只输出 JSON，不要解释或补充说明。"
     "不要输出拒绝/免责声明/权限说明（例如“我无法访问账号”）。"
     "只输出单一 JSON 对象，格式如下："
     "{"
-    "\"action\": \"chat|image_chat|image_generate|image_create|weather|avatar_get|travel_plan|history_clear|ignore\","
-    "\"target\": \"message_image|reply_image|at_user|last_image|sender_avatar|group_avatar|qq_avatar|message_id|wait_next|city|trip|none\","
+    "\"action\": \"chat|image_chat|image_generate|image_create|weather|avatar_get|travel_plan|web_summary|history_clear|ignore\","
+    "\"target\": \"message_image|reply_image|at_user|last_image|sender_avatar|group_avatar|qq_avatar|message_id|wait_next|city|trip|url|none\","
     "\"params\": {\"qq\": \"string\", \"message_id\": \"int\", \"city\": \"string\","
-    " \"destination\": \"string\", \"days\": \"int\", \"nights\": \"int\", \"reply\": \"string\"}"
+    " \"destination\": \"string\", \"days\": \"int\", \"nights\": \"int\","
+    " \"url\": \"string\", \"focus\": \"string\", \"reply\": \"string\"}"
     "}"
     "规则："
     "- action=ignore：target=none，params={}。"
@@ -121,11 +200,12 @@ _INTENT_SYSTEM_PROMPT = (
     "- action=weather：查询天气；target=city；params.city 为地点（没有就留空）。"
     "- action=avatar_get：获取头像；target 可为 sender_avatar/group_avatar/qq_avatar/at_user；target=qq_avatar 时填 params.qq。"
     "- action=travel_plan：旅行规划；target=trip；params.destination/days/nights 可填则填。"
+    "- action=web_summary：网页总结；target=url；params.url 为链接（没有就留空），支持 github.com、v2ex.com、linux.do、news.ycombinator.com、bilibili.com、zhihu.com、x.com、twitter.com，params.focus 可选。"
     "- action=history_clear：清除当前会话历史；target=none。"
     "- target=message_id 时填写 params.message_id。"
     "- params 仅在对应 target/场景需要时填写，其余为空对象。"
     "- 若旅行或天气缺关键信息，仍输出对应 action，缺失字段留空"
-    "- 当需要调用第三方工具且可能耗时（如 weather、image_create、image_generate、image_chat、avatar_get、travel_plan）时，可在 params.reply 中给等待/过渡语。"
+    "- 当需要调用第三方工具且可能耗时（如 weather、image_create、image_generate、image_chat、avatar_get、travel_plan、web_summary）时，可在 params.reply 中给等待/过渡语。"
     "- 若消息里 @ 多人，仍输出 target=at_user，系统会按顺序处理多个头像。"
     "- 上下文可能包含“昵称: 内容”的格式，需识别说话人。"
 )
@@ -326,6 +406,14 @@ def _bot_display_name(bot: Bot) -> str:
     return "嘉然"
 
 
+def _command_starts() -> List[str]:
+    try:
+        starts = list(get_driver().config.command_start or [])
+    except Exception:
+        starts = ["/"]
+    return [str(item) for item in starts if isinstance(item, str)]
+
+
 def _strip_leading_command(text: str, words: Tuple[str, ...]) -> str:
     """Strip leading nonebot command prefix + command word (when it looks like a command).
 
@@ -334,10 +422,7 @@ def _strip_leading_command(text: str, words: Tuple[str, ...]) -> str:
     value = str(text or "").strip()
     if not value:
         return ""
-    try:
-        starts = list(get_driver().config.command_start or [])
-    except Exception:
-        starts = ["/"]
+    starts = _command_starts()
     if "" not in starts:
         starts.append("")
     seps = set(" \t\r\n:：,，。.!！?？;；")
@@ -547,6 +632,8 @@ def _transition_text(action: str) -> Optional[str]:
         return "正在生成图片，请稍候..."
     if action in {"image_generate"}:
         return "正在处理图片，请稍候..."
+    if action in {"web_summary"}:
+        return "正在抓取网页并总结，请稍候..."
     return None
 
 
@@ -671,6 +758,13 @@ class CachedImage:
 
 
 @dataclass
+class HistoryCompressPlan:
+    items: List[HistoryItem]
+    item_ids: set[int]
+    summary_ts: float
+
+
+@dataclass
 class SessionState:
     history: List[HistoryItem]
     last_image_id: Optional[int]
@@ -682,10 +776,12 @@ class SessionState:
     history_lock: asyncio.Lock
     summary_last_ts: float
     summary_in_progress: bool
+    summary_task: Optional[asyncio.Task[None]]
 
 
 _SESSIONS: dict[str, SessionState] = {}
 _CLIENT: Optional[genai.Client] = None
+_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 
 
 def _session_id(event: MessageEvent) -> str:
@@ -719,6 +815,7 @@ def _get_state(session_id: str) -> SessionState:
             history_lock=asyncio.Lock(),
             summary_last_ts=0.0,
             summary_in_progress=False,
+            summary_task=None,
         )
         _SESSIONS[session_id] = state
     return state
@@ -731,6 +828,174 @@ def _get_client() -> genai.Client:
             raise RuntimeError("未配置 GOOGLE_API_KEY")
         _CLIENT = genai.Client(api_key=config.google_api_key)
     return _CLIENT
+
+
+def _request_timeout_seconds() -> float:
+    try:
+        timeout = float(getattr(config, "request_timeout", 30.0))
+    except Exception:
+        timeout = 30.0
+    if timeout <= 0:
+        return 30.0
+    return timeout
+
+
+def _image_download_max_bytes() -> int:
+    try:
+        value = int(getattr(config, "image_download_max_bytes", 0))
+    except Exception:
+        value = 0
+    if value <= 0:
+        return _DEFAULT_IMAGE_DOWNLOAD_MAX_BYTES
+    return max(256 * 1024, value)
+
+
+def _web_fetch_max_bytes() -> int:
+    try:
+        value = int(getattr(config, "web_fetch_max_bytes", 0))
+    except Exception:
+        value = 0
+    if value <= 0:
+        return _DEFAULT_WEB_FETCH_MAX_BYTES
+    return max(256 * 1024, value)
+
+
+def _web_extract_max_chars() -> int:
+    try:
+        value = int(getattr(config, "web_extract_max_chars", 0))
+    except Exception:
+        value = 0
+    if value <= 0:
+        return _DEFAULT_WEB_EXTRACT_MAX_CHARS
+    return max(1000, value)
+
+
+def _extract_first_url(text: str) -> Optional[str]:
+    if not text:
+        return None
+    match = _URL_IN_TEXT_RE.search(text)
+    if not match:
+        return None
+    url = match.group(1).strip()
+    while url and url[-1] in _URL_TRAILING_PUNCT:
+        url = url[:-1]
+    while url and url[0] in _URL_LEADING_PUNCT:
+        url = url[1:]
+    return url or None
+
+
+def _web_summary_root_host(host: str) -> str:
+    normalized = str(host or "").strip().lower().rstrip(".")
+    if not normalized:
+        return ""
+    for root in _WEB_SUMMARY_ALLOWED_ROOT_HOSTS:
+        if normalized == root or normalized.endswith(f".{root}"):
+            return root
+    return ""
+
+
+def _web_summary_site_name(host: str) -> str:
+    root = _web_summary_root_host(host)
+    if root:
+        return _WEB_SUMMARY_HOST_LABELS.get(root, root)
+    return ""
+
+
+def _is_allowed_web_summary_host(host: str) -> bool:
+    return bool(_web_summary_site_name(host))
+
+
+def _normalize_web_summary_url(raw_url: str) -> Optional[str]:
+    candidate = str(raw_url or "").strip()
+    if not candidate:
+        return None
+    candidate = candidate.strip(" \t\r\n<>[]()\"'")
+    if "://" not in candidate:
+        host_part = candidate.split("/", 1)[0].strip()
+        if ":" in host_part:
+            host_part = host_part.split(":", 1)[0].strip()
+        if _is_allowed_web_summary_host(host_part):
+            candidate = f"https://{candidate}"
+
+    parsed = urlsplit(candidate)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        return None
+    if parsed.username or parsed.password:
+        return None
+    host = (parsed.hostname or "").strip()
+    if not _is_allowed_web_summary_host(host):
+        return None
+    if parsed.port not in {None, 80, 443}:
+        return None
+    netloc = parsed.netloc
+    if not netloc:
+        return None
+    path = parsed.path or "/"
+    normalized = urlunsplit((scheme, netloc, path, parsed.query, ""))
+    return normalized
+
+
+def _web_summary_help_message() -> str:
+    return (
+        "请提供要总结的网页链接，例如：网页总结 https://github.com/owner/repo，"
+        f"支持{_WEB_SUMMARY_SITES_TEXT}。"
+    )
+
+
+def _web_summary_source_label(url: str) -> str:
+    parsed = urlsplit(url or "")
+    return _web_summary_site_name(parsed.hostname or "") or "网页"
+
+
+def _normalize_github_url(raw_url: str) -> Optional[str]:
+    # Backward compatibility wrapper
+    return _normalize_web_summary_url(raw_url)
+
+
+def _normalize_content_type(value: object, *, default: str = "image/jpeg") -> str:
+    if isinstance(value, str):
+        cleaned = value.split(";", 1)[0].strip().lower()
+        if cleaned:
+            return cleaned
+    return default
+
+
+def _validate_image_bytes(content_type: str, data: bytes) -> Tuple[str, bytes]:
+    normalized_type = _normalize_content_type(content_type)
+    if normalized_type in {"application/octet-stream", "binary/octet-stream"}:
+        normalized_type = "image/jpeg"
+    if not normalized_type.startswith("image/"):
+        raise UnsupportedImageError("只支持图片内容。")
+    if not data:
+        raise UnsupportedImageError("图片内容为空。")
+    limit = _image_download_max_bytes()
+    if len(data) > limit:
+        limit_mb = max(1, limit // (1024 * 1024))
+        raise UnsupportedImageError(f"图片过大，请限制在 {limit_mb}MB 内。")
+    return normalized_type, data
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None or _HTTP_CLIENT.is_closed:
+        _HTTP_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(_request_timeout_seconds()),
+            follow_redirects=True,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+        )
+    return _HTTP_CLIENT
+
+
+@get_driver().on_shutdown
+async def _close_http_client() -> None:
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        return
+    try:
+        await _HTTP_CLIENT.aclose()
+    finally:
+        _HTTP_CLIENT = None
 
 
 def _history_compress_enabled() -> bool:
@@ -906,48 +1171,83 @@ async def _summarize_history_items(items: List[HistoryItem]) -> Optional[str]:
     return cleaned
 
 
-async def _maybe_compress_history(state: SessionState) -> bool:
-    # 历史压缩：达到阈值时把旧记录摘要成一条“系统摘要”，保留最近若干条
+def _create_history_compress_plan(state: SessionState) -> Optional[HistoryCompressPlan]:
+    # 持锁调用：判断是否需要压缩，并冻结一次摘要计划
     if not _history_compress_enabled():
-        return False
+        return None
     if not config.google_api_key:
-        return False
+        return None
     if state.summary_in_progress:
-        return False
+        return None
     trigger = _history_compress_trigger()
     if len(state.history) < trigger:
-        return False
+        return None
     keep = max(0, _history_compress_keep())
     if keep >= len(state.history):
-        return False
+        return None
     compress_items = state.history[:-keep] if keep > 0 else list(state.history)
+    if not compress_items:
+        return None
     if _count_non_summary_items(compress_items) < _history_compress_min_messages():
-        return False
+        return None
     if not any(item.to_bot or item.role == "model" for item in compress_items):
-        return False
+        return None
     state.summary_in_progress = True
-    try:
-        summary = await _summarize_history_items(compress_items)
-    except Exception as exc:
-        logger.error("History summary failed: {}", _safe_error_message(exc))
+    return HistoryCompressPlan(
+        items=list(compress_items),
+        item_ids={id(item) for item in compress_items},
+        summary_ts=compress_items[-1].ts,
+    )
+
+
+def _apply_history_summary(state: SessionState, plan: HistoryCompressPlan, summary: str) -> bool:
+    summary_text = _format_reply_text(summary or "")
+    summary_text = _compact_reply_lines(summary_text)
+    summary_text = _limit_reply_text(summary_text, _history_compress_max_chars())
+    if not summary_text:
         return False
-    finally:
-        state.summary_in_progress = False
-    if not summary:
+    kept_items: List[HistoryItem] = []
+    removed = False
+    for item in state.history:
+        if id(item) in plan.item_ids:
+            removed = True
+            continue
+        kept_items.append(item)
+    if not removed:
         return False
-    ts = compress_items[-1].ts if compress_items else _now()
     summary_item = HistoryItem(
         role="user",
-        text=summary,
-        ts=ts,
+        text=summary_text,
+        ts=plan.summary_ts,
         user_name="系统摘要",
         to_bot=True,
         is_summary=True,
     )
-    keep_items = state.history[-keep:] if keep > 0 else []
-    state.history = [summary_item, *keep_items]
+    state.history = [summary_item, *kept_items]
     state.summary_last_ts = _now()
     return True
+
+
+async def _run_history_compress_task(
+    state: SessionState, plan: HistoryCompressPlan
+) -> None:
+    summary: Optional[str] = None
+    try:
+        summary = await _summarize_history_items(plan.items)
+    except asyncio.CancelledError:
+        summary = None
+    except Exception as exc:
+        logger.error("History summary failed: {}", _safe_error_message(exc))
+
+    current_task = asyncio.current_task()
+    async with state.history_lock:
+        if state.summary_task is not current_task:
+            return
+        if summary:
+            _apply_history_summary(state, plan, summary)
+        _prune_state(state)
+        state.summary_in_progress = False
+        state.summary_task = None
 
 
 def _image_cache_max_images() -> int:
@@ -1024,6 +1324,10 @@ def _clear_session_state(state: SessionState) -> None:
             if task and not task.done():
                 task.cancel()
     state.image_cache_tasks = {}
+    summary_task = state.summary_task
+    if summary_task and not summary_task.done():
+        summary_task.cancel()
+    state.summary_task = None
     state.summary_last_ts = 0.0
     state.summary_in_progress = False
     if state.pending_image_waiters:
@@ -1387,10 +1691,14 @@ async def _build_weather_messages(query: str) -> List[str]:
 
 async def _geocode_location(query: str) -> Optional[dict]:
     params = {"name": query, "count": 1, "language": "zh", "format": "json"}
-    async with httpx.AsyncClient(timeout=config.request_timeout) as client:
-        resp = await client.get("https://geocoding-api.open-meteo.com/v1/search", params=params)
-        resp.raise_for_status()
-        data = resp.json()
+    client = _get_http_client()
+    resp = await client.get(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params=params,
+        timeout=_request_timeout_seconds(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
     results = data.get("results") if isinstance(data, dict) else None
     if not results:
         return None
@@ -1404,10 +1712,14 @@ async def _fetch_current_weather(lat: float, lon: float) -> Optional[dict]:
         "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
         "timezone": "auto",
     }
-    async with httpx.AsyncClient(timeout=config.request_timeout) as client:
-        resp = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
-        resp.raise_for_status()
-        data = resp.json()
+    client = _get_http_client()
+    resp = await client.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params=params,
+        timeout=_request_timeout_seconds(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
     if not isinstance(data, dict):
         return None
     return data
@@ -1633,6 +1945,259 @@ async def _call_gemini_travel_plan(
     return cleaned
 
 
+def _extract_html_title(html_text: str) -> str:
+    if not html_text:
+        return ""
+    match = _HTML_TITLE_RE.search(html_text)
+    if not match:
+        return ""
+    title = html.unescape(match.group(1))
+    title = _collapse_spaces(title)
+    return title
+
+
+def _extract_web_main_html(html_text: str, *, host: str = "") -> str:
+    if not html_text:
+        return ""
+    root_host = _web_summary_root_host(host)
+    site_patterns = _WEB_SITE_BLOCK_PATTERNS.get(root_host, ())
+    for pattern in site_patterns:
+        match = pattern.search(html_text)
+        if match and match.group(1).strip():
+            return match.group(1)
+    for pattern in _WEB_COMMON_BLOCK_PATTERNS:
+        match = pattern.search(html_text)
+        if match and match.group(1).strip():
+            return match.group(1)
+    return html_text
+
+
+def _html_to_plain_text(html_text: str) -> str:
+    if not html_text:
+        return ""
+    cleaned = _HTML_COMMENT_RE.sub(" ", html_text)
+    cleaned = _HTML_DROP_BLOCK_RE.sub(" ", cleaned)
+    cleaned = _HTML_BLOCK_TAG_RE.sub("\n", cleaned)
+    cleaned = _HTML_TAG_RE.sub(" ", cleaned)
+    cleaned = html.unescape(cleaned).replace("\xa0", " ")
+    lines: List[str] = []
+    for raw_line in cleaned.splitlines():
+        line = _collapse_spaces(raw_line)
+        if line:
+            lines.append(line)
+    text = "\n".join(lines).strip()
+    if not text:
+        return ""
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+def _extract_web_page_text(html_text: str, *, host: str = "") -> str:
+    if not html_text:
+        return ""
+    title = _extract_html_title(html_text)
+    primary_html = _extract_web_main_html(html_text, host=host)
+    primary_text = _html_to_plain_text(primary_html)
+    if not primary_text:
+        primary_text = _html_to_plain_text(html_text)
+    if not primary_text:
+        return ""
+
+    if title:
+        if title not in primary_text[:120]:
+            primary_text = f"页面标题: {title}\n{primary_text}"
+
+    limit = _web_extract_max_chars()
+    if len(primary_text) > limit:
+        primary_text = primary_text[:limit].rstrip() + "\n[内容已截断]"
+    return primary_text
+
+
+async def _fetch_web_page_text(url: str) -> str:
+    client = _get_http_client()
+    max_bytes = _web_fetch_max_bytes()
+    headers = {
+        "User-Agent": "nonebot-plugin-skills/1.0",
+        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1",
+    }
+    chunks: List[bytes] = []
+    total = 0
+    encoding = "utf-8"
+    content_type = ""
+    source_host = ""
+    async with client.stream(
+        "GET",
+        url,
+        headers=headers,
+        timeout=_request_timeout_seconds(),
+    ) as resp:
+        resp.raise_for_status()
+        final_host = str(getattr(resp.url, "host", "") or "").strip().lower()
+        source_host = final_host
+        if final_host and not _is_allowed_web_summary_host(final_host):
+            raise RuntimeError("重定向后不是受支持站点，已拒绝访问")
+        content_type = str(resp.headers.get("content-type") or "").lower()
+        if content_type and "text/html" not in content_type and "text/plain" not in content_type:
+            raise RuntimeError(f"链接不是网页文本内容（{content_type}）")
+        encoding = resp.encoding or "utf-8"
+        async for chunk in resp.aiter_bytes():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                limit_mb = max(1, max_bytes // (1024 * 1024))
+                raise RuntimeError(f"网页内容过大，请限制在 {limit_mb}MB 内")
+            chunks.append(chunk)
+    data = b"".join(chunks)
+    if not data:
+        raise RuntimeError("网页内容为空")
+    try:
+        html_text = data.decode(encoding, errors="ignore")
+    except LookupError:
+        html_text = data.decode("utf-8", errors="ignore")
+    text = _extract_web_page_text(html_text, host=source_host)
+    if not text:
+        raise RuntimeError("未提取到可读正文")
+    return text
+
+
+def _build_web_summary_prompt(url: str, page_text: str, *, focus: str = "") -> str:
+    source_label = _web_summary_source_label(url)
+    parts: List[str] = [
+        f"请总结下面{source_label}网页内容。",
+        f"链接: {url}",
+    ]
+    if focus:
+        parts.append(f"用户关注点: {focus}")
+    parts.append("网页正文提取结果:")
+    parts.append(page_text)
+    parts.append("输出要求：纯文本，先给重点结论，再给关键细节。")
+    return "\n".join(parts)
+
+
+async def _call_gemini_web_summary(
+    url: str,
+    page_text: str,
+    state: SessionState,
+    *,
+    focus: str = "",
+) -> str:
+    client = _get_client()
+    prompt = _build_web_summary_prompt(url, page_text, focus=focus)
+    config_obj, system_used = _build_generate_config(system_instruction=_WEB_SUMMARY_SYSTEM_PROMPT)
+    if _WEB_SUMMARY_SYSTEM_PROMPT and not system_used:
+        prompt = f"{_WEB_SUMMARY_SYSTEM_PROMPT}\n\n{prompt}"
+    if _history_reference_only():
+        prompt = _wrap_prompt_with_reference(state, prompt, current_label="当前任务")
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=prompt)],
+            )
+        ]
+    else:
+        contents = _history_to_gemini(state)
+        contents.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
+    response = await asyncio.wait_for(
+        client.aio.models.generate_content(
+            model=config.gemini_text_model,
+            contents=contents,
+            config=config_obj,
+        ),
+        timeout=config.request_timeout,
+    )
+    if config.gemini_log_response:
+        logger.info("Gemini web summary response: {}", _dump_response(response))
+        _log_response_text("Gemini web summary content", response)
+    if response.text:
+        cleaned = _format_reply_text(response.text.strip())
+        cleaned = _compact_reply_lines(cleaned)
+        cleaned = _limit_reply_text(cleaned)
+        return cleaned
+    text_parts: List[str] = []
+    for part in _iter_response_parts(response):
+        text_value = _extract_text_value(part)
+        if text_value:
+            text_parts.append(text_value)
+    cleaned = _format_reply_text("\n".join(text_parts).strip())
+    cleaned = _compact_reply_lines(cleaned)
+    cleaned = _limit_reply_text(cleaned)
+    return cleaned
+
+
+def _extract_web_summary_focus(raw_text: str, url: str) -> str:
+    if not raw_text:
+        return ""
+    focus = str(raw_text)
+    if url:
+        variants = {
+            url,
+            url.replace("https://", "http://"),
+            url.replace("http://", "https://"),
+        }
+        parsed = urlsplit(url)
+        host = (parsed.netloc or "").strip()
+        path = parsed.path or ""
+        query = parsed.query or ""
+        if host:
+            variants.add(host)
+            if path:
+                plain = f"{host}{path}"
+                variants.add(plain)
+                variants.add(plain.lstrip("/"))
+                if query:
+                    variants.add(f"{plain}?{query}")
+            elif query:
+                variants.add(f"{host}?{query}")
+        for value in variants:
+            if value:
+                focus = focus.replace(value, " ")
+    focus = _collapse_spaces(focus)
+    if len(focus) > 200:
+        focus = focus[:200].rstrip() + "..."
+    return focus
+
+
+async def _build_web_summary_reply(
+    intent: dict,
+    state: SessionState,
+    event: MessageEvent,
+    *,
+    raw_text: str,
+) -> str:
+    params = _intent_params(intent)
+    raw_url = params.get("url")
+    url = raw_url.strip() if isinstance(raw_url, str) else ""
+    if not url:
+        url = _extract_first_url(raw_text) or ""
+    normalized_url = _normalize_web_summary_url(url)
+    if not normalized_url:
+        return (
+            f"目前支持{_WEB_SUMMARY_SITES_TEXT}链接，"
+            "请发送完整 URL。"
+        )
+    focus_raw = params.get("focus")
+    focus = focus_raw.strip() if isinstance(focus_raw, str) else ""
+    if not focus:
+        focus = _extract_web_summary_focus(raw_text, normalized_url)
+    page_text = await _fetch_web_page_text(normalized_url)
+    reply = await _call_gemini_web_summary(normalized_url, page_text, state, focus=focus)
+    if not reply:
+        raise RuntimeError("总结结果为空，请稍后再试")
+    user_name = _event_user_name(event)
+    summary = normalized_url if not focus else f"{normalized_url} 关注:{focus}"
+    await _append_history(
+        state,
+        "user",
+        f"网页总结：{summary}",
+        user_id=str(event.get_user_id()),
+        user_name=user_name,
+        to_bot=True,
+    )
+    await _append_history(state, "model", reply)
+    return reply
+
+
 _DATA_URL_RE = re.compile(
     r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.*)$", re.I | re.S
 )
@@ -1701,14 +2266,31 @@ def _decode_base64_ref(value: str) -> Optional[Tuple[str, bytes]]:
 
 
 async def _download_image_bytes_from_url(url: str) -> Tuple[str, bytes]:
-    async with httpx.AsyncClient(timeout=config.request_timeout) as client:
-        resp = await client.get(url)
+    client = _get_http_client()
+    max_bytes = _image_download_max_bytes()
+    max_mb = max(1, max_bytes // (1024 * 1024))
+    chunks: List[bytes] = []
+    total = 0
+    content_type = "image/jpeg"
+    async with client.stream("GET", url, timeout=_request_timeout_seconds()) as resp:
         resp.raise_for_status()
-        content_type = resp.headers.get("content-type", "image/jpeg")
-        data = resp.content
-    if isinstance(content_type, str):
-        content_type = content_type.split(";", 1)[0].strip() or "image/jpeg"
-    return content_type, data
+        content_type = _normalize_content_type(resp.headers.get("content-type"), default="image/jpeg")
+        if content_type in {"application/octet-stream", "binary/octet-stream"}:
+            content_type = "image/jpeg"
+        if not content_type.startswith("image/"):
+            raise UnsupportedImageError("仅支持下载图片内容。")
+        content_length = _coerce_int(resp.headers.get("content-length"))
+        if content_length is not None and content_length > max_bytes:
+            raise UnsupportedImageError(f"图片过大，请限制在 {max_mb}MB 内。")
+        async for chunk in resp.aiter_bytes():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                raise UnsupportedImageError(f"图片过大，请限制在 {max_mb}MB 内。")
+            chunks.append(chunk)
+    data = b"".join(chunks)
+    return _validate_image_bytes(content_type, data)
 
 
 async def _download_image_bytes_ref(bot: Bot, ref: str) -> Tuple[str, bytes]:
@@ -1718,12 +2300,12 @@ async def _download_image_bytes_ref(bot: Bot, ref: str) -> Tuple[str, bytes]:
     if ref.lower().startswith("data:image"):
         decoded = _decode_data_url(ref)
         if decoded:
-            return decoded
+            return _validate_image_bytes(decoded[0], decoded[1])
         raise RuntimeError("无法解析 data URL")
     if ref.lower().startswith("base64://"):
         decoded = _decode_base64_ref(ref)
         if decoded:
-            return decoded
+            return _validate_image_bytes(decoded[0], decoded[1])
         raise RuntimeError("无法解析 base64 图片")
     if ref.lower().startswith("http://") or ref.lower().startswith("https://"):
         return await _download_image_bytes_from_url(ref)
@@ -1968,6 +2550,7 @@ async def _append_history(
     ts: Optional[float] = None,
     message_id: Optional[int] = None,
 ) -> None:
+    plan: Optional[HistoryCompressPlan] = None
     async with state.history_lock:
         if role == "model" and not user_name:
             user_name = _model_user_name()
@@ -1983,8 +2566,13 @@ async def _append_history(
             )
         )
         _prune_state(state, trim_history=False)
-        await _maybe_compress_history(state)
-        _prune_state(state)
+        plan = _create_history_compress_plan(state)
+        if plan:
+            state.summary_task = asyncio.create_task(_run_history_compress_task(state, plan))
+        elif not state.summary_in_progress:
+            _prune_state(state)
+        else:
+            _prune_state(state, trim_history=False)
 
 
 history_collector = on_message(priority=99, block=False)
@@ -1993,6 +2581,11 @@ avatar_handler = on_command("处理头像", priority=5)
 chat_handler = on_command("技能", aliases={"聊天", "对话"}, priority=5)
 weather_handler = on_command("天气", aliases={"查询天气", "查天气"}, priority=5)
 travel_handler = on_command("旅行规划", aliases={"旅行计划", "行程规划", "旅行", "行程"}, priority=5)
+web_summary_handler = on_command(
+    "网页总结",
+    aliases={"总结网页", "总结链接", "链接总结", "网页摘要", "总结github"},
+    priority=5,
+)
 
 
 @history_collector.handle()
@@ -2034,10 +2627,7 @@ def _is_command_message(text: str) -> bool:
     text = text.strip()
     if not text:
         return False
-    try:
-        starts = list(get_driver().config.command_start or [])
-    except Exception:
-        starts = ["/"]
+    starts = _command_starts()
     if not starts:
         return False
     command_words = [
@@ -2053,6 +2643,12 @@ def _is_command_message(text: str) -> bool:
         "行程规划",
         "旅行",
         "行程",
+        "网页总结",
+        "总结网页",
+        "总结链接",
+        "链接总结",
+        "网页摘要",
+        "总结github",
     ]
     for prefix in starts:
         if not prefix:
@@ -2381,6 +2977,7 @@ _ALLOWED_ACTIONS = {
     "weather",
     "avatar_get",
     "travel_plan",
+    "web_summary",
     "history_clear",
     "ignore",
 }
@@ -2395,6 +2992,7 @@ _ALLOWED_TARGETS = {
     "message_id",
     "wait_next",
     "trip",
+    "url",
     "none",
 }
 
@@ -2480,6 +3078,25 @@ def _normalize_intent(
         return {
             "action": action,
             "target": "city",
+            "params": normalized_params,
+        }
+
+    if action == "web_summary":
+        raw_url = params.get("url")
+        url = raw_url.strip() if isinstance(raw_url, str) else ""
+        raw_focus = params.get("focus")
+        focus = raw_focus.strip() if isinstance(raw_focus, str) else ""
+        normalized_params: dict[str, object] = {}
+        if url:
+            normalized_params["url"] = url
+        if focus:
+            normalized_params["focus"] = focus
+        raw_reply = params.get("reply")
+        if isinstance(raw_reply, str) and raw_reply.strip():
+            normalized_params["reply"] = raw_reply.strip()
+        return {
+            "action": action,
+            "target": "url",
             "params": normalized_params,
         }
 
@@ -2599,6 +3216,7 @@ async def _dispatch_intent(
     if action in {
         "weather",
         "travel_plan",
+        "web_summary",
         "avatar_get",
         "image_chat",
         "image_generate",
@@ -2619,6 +3237,7 @@ async def _dispatch_intent(
         "chat",
         "weather",
         "travel_plan",
+        "web_summary",
         "image_create",
         "image_chat",
         "image_generate",
@@ -2710,6 +3329,30 @@ async def _dispatch_intent(
             _mark_handled_request(state, event, text)
         except Exception as exc:
             logger.error("NLP travel failed: {}", _safe_error_message(exc))
+            await send_func(f"出错了：{_safe_error_message(exc)}")
+        return
+
+    if action == "web_summary":
+        # 网页总结
+        raw_text = _strip_leading_command(
+            raw_message_text,
+            ("网页总结", "总结网页", "总结链接", "链接总结", "总结github", "网页摘要"),
+        )
+        if not raw_text:
+            raw_text = raw_message_text.strip()
+        if not raw_text:
+            await send_func(_web_summary_help_message())
+            return
+        if not transition_sent:
+            await _send_transition(action, send_func)
+        try:
+            reply = await _build_web_summary_reply(intent, state, event, raw_text=raw_text)
+            if not reply:
+                return
+            await _send_text_response(bot, event, send_func, reply)
+            _mark_handled_request(state, event, text)
+        except Exception as exc:
+            logger.error("NLP web summary failed: {}", _safe_error_message(exc))
             await send_func(f"出错了：{_safe_error_message(exc)}")
         return
 
@@ -2952,8 +3595,8 @@ async def _dispatch_intent(
 
 def _clarify_intent_text(has_image: bool) -> str:
     if has_image:
-        return "我没太听懂，你是想聊这张图、处理图片、查天气还是旅行规划？"
-    return "我没太听懂，你是想聊天、处理图片、无图生成、查天气、旅行规划还是清除历史？"
+        return "我没太听懂，你是想聊这张图、处理图片、查天气、旅行规划还是网页总结？"
+    return "我没太听懂，你是想聊天、处理图片、无图生成、查天气、旅行规划、网页总结还是清除历史？"
 
 
 _TRAVEL_KEYWORDS = ("旅行", "旅游", "行程", "出行", "游玩")
@@ -3299,4 +3942,17 @@ async def handle_travel(bot: Bot, event: MessageEvent, args: Message = CommandAr
         event,
         text=f"旅行规划 {text}",
         send_func=travel_handler.send,
+    )
+
+
+@web_summary_handler.handle()
+async def handle_web_summary(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+    query = args.extract_plain_text().strip()
+    if not query:
+        await web_summary_handler.finish(_web_summary_help_message())
+    await _handle_command_via_intent(
+        bot,
+        event,
+        text=f"网页总结 {query}",
+        send_func=web_summary_handler.send,
     )

@@ -8,10 +8,13 @@ from pydantic import BaseModel
 
 class Config(BaseModel):
     google_api_key: str = ""
-    gemini_text_model: str = "gemini-3-pro-preview"
+    gemini_text_model: str = "gemini-3-flash-preview"
     gemini_image_model: str = "nano-banana-pro-preview"
     request_timeout: float = 30.0
     image_timeout: float = 120.0
+    image_download_max_bytes: int = 15728640
+    web_fetch_max_bytes: int = 2097152
+    web_extract_max_chars: int = 12000
     history_ttl_sec: int = 600
     history_max_messages: int = 10
     image_cache_max_images: int = 10

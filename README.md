@@ -1,11 +1,12 @@
 # nonebot-plugin-skills
 
-基于 Google Gemini 的头像/图片处理与聊天插件，内置上下文缓存、群/私聊隔离，并支持从聊天记录中自动获取最近头像/图片。
+基于 Google Gemini 的头像/图片处理、聊天与网页总结插件，内置上下文缓存、群/私聊隔离，并支持从聊天记录中自动获取最近头像/图片。
 
 ## 功能
 - 处理头像/图片：命令内带图、@某人头像、或使用最近聊天图片
 - 聊天对话：带上下文的自然语言聊天
 - 天气查询：输入城市/地区即可查询当前天气
+- 网页总结：抓取并总结主流网站网页正文（支持 `github.com`、`v2ex.com`、`linux.do`、`news.ycombinator.com`、`bilibili.com`、`zhihu.com`、`x.com`、`twitter.com`）
 - 上下文缓存：按群/私聊隔离，定时过期
 - 图片缓存：默认缓存最近 10 张图片（按会话隔离），避免图片链接过期
 - 动图/表情包：支持识别与对话（如 GIF、商城表情等）
@@ -41,6 +42,9 @@ GEMINI_IMAGE_MODEL=nano-banana-pro-preview
 # 超时（秒）
 REQUEST_TIMEOUT=30.0
 IMAGE_TIMEOUT=120.0
+IMAGE_DOWNLOAD_MAX_BYTES=15728640     # 单张下载图片大小上限（字节，默认15MB）
+WEB_FETCH_MAX_BYTES=2097152            # 网页抓取大小上限（字节，默认2MB）
+WEB_EXTRACT_MAX_CHARS=12000            # 提取正文后送入总结的最大字符数
 
 # 会话历史
 HISTORY_TTL_SEC=600                  # 会话状态保留时长
@@ -79,6 +83,7 @@ GEMINI_LOG_RESPONSE=false
 | 聊天 <内容> | 上下文聊天 |
 | 技能 <内容> | 上下文聊天 |
 | 天气 <城市> | 查询当前天气 |
+| 网页总结 <网页链接> | 总结主流网站网页正文 |
 
 ### 示例
 - `Diana帮忙把@向晚头像变成黑白`
@@ -86,5 +91,8 @@ GEMINI_LOG_RESPONSE=false
 - `处理头像 @小明 变成油画风`
 - `聊天 你还记得刚才的头像吗？`
 - `天气 上海`
+- `网页总结 https://github.com/owner/repo`
+- `网页总结 https://linux.do/t/topic/12345 重点看结论和待办`
+- `网页总结 https://www.zhihu.com/question/123456789`
 
 > 若图片模型仅返回文本结果，插件会直接把文本回复出来（便于你确认模型是否支持图像输出）。
