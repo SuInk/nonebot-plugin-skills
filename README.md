@@ -95,7 +95,7 @@ ARIA2_BT_MAX_PEERS=200
 ARIA2_DISABLE_SEED=true               # true 时自动带 seed-time=0 和 seed-ratio=0（禁止做种）
 BANGUMI_AUTO_SEND_FILE=true           # 下载完成后自动把文件发回 QQ
 BANGUMI_AUTO_DELETE_AFTER_SEND=true   # 发送成功后删除本地文件
-BANGUMI_SEND_TEXT_REPLY=false         # 番剧下载过程是否发送QQ文字回复（默认否）
+BANGUMI_SEND_TEXT_REPLY=true          # 番剧下载过程是否发送QQ文字回复（默认是）
 BANGUMI_PROGRESS_NOTIFY_INTERVAL_SEC=20.0 # 下载状态轮询间隔（秒，不会自动推送进度）
 BANGUMI_DOWNLOAD_WATCH_TIMEOUT_SEC=21600.0
 BANGUMI_TORRENT_MAX_BYTES=4194304     # 种子文件最大体积（默认 4MB）

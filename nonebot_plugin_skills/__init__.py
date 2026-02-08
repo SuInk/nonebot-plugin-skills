@@ -1118,9 +1118,9 @@ def _bangumi_auto_delete_after_send() -> bool:
 
 def _bangumi_send_text_reply() -> bool:
     try:
-        return bool(getattr(config, "bangumi_send_text_reply", False))
+        return bool(getattr(config, "bangumi_send_text_reply", True))
     except Exception:
-        return False
+        return True
 
 
 def _bangumi_progress_notify_interval_sec() -> float:
@@ -4101,7 +4101,7 @@ async def _build_bangumi_download_reply(
             gid=gid,
             keyword=title,
         )
-        lines = [f"已提交到 aria2，任务ID：{gid}", f"番剧：{title}"]
+        lines = [f"已提交到 aria2 并开始下载，任务ID：{gid}", f"番剧：{title}"]
         if resolved_uri:
             lines.append(f"来源：{resolved_uri}")
         if torrent_bytes is not None:
@@ -4148,7 +4148,10 @@ async def _build_bangumi_download_reply(
     if not selected:
         return reason or "没有找到匹配资源。"
 
-    gid = await _aria2_add_uri(selected.download_url)
+    try:
+        gid = await _aria2_add_uri(selected.download_url)
+    except Exception as exc:
+        return f"提交下载失败：{_safe_error_message(exc)}"
     _start_bangumi_download_watch(
         bot,
         event,
@@ -4163,7 +4166,7 @@ async def _build_bangumi_download_reply(
     )
 
     lines = []
-    lines.append(f"已提交到 aria2，任务ID：{gid}")
+    lines.append(f"已提交到 aria2 并开始下载，任务ID：{gid}")
     lines.append(f"番剧：{selected.bangumi_title or keyword}")
     if selected.episode is not None:
         lines.append(f"集数：第{selected.episode}集")

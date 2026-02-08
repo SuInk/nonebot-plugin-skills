@@ -49,7 +49,7 @@ class Config(BaseModel):
     aria2_disable_seed: bool = True
     bangumi_auto_send_file: bool = True
     bangumi_auto_delete_after_send: bool = True
-    bangumi_send_text_reply: bool = False
+    bangumi_send_text_reply: bool = True
     bangumi_progress_notify_interval_sec: float = 20.0
     bangumi_download_watch_timeout_sec: float = 21600.0
     bangumi_torrent_max_bytes: int = 4194304
