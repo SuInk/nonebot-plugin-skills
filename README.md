@@ -5,10 +5,12 @@
 ## 功能
 - 处理头像/图片：命令内带图、@某人头像、或使用最近聊天图片
 - 聊天对话：带上下文的自然语言聊天
-- 三阶段聊天：知识草稿 -> 嘉然风格改写 -> 事实对齐校验（冲突时自动回退到事实正确版本）
+- 单次调用聊天：一次生成事实答案与嘉然风格回复，事实冲突时自动回退到事实版
 - 天气查询：输入城市/地区即可查询当前天气
 - 网页总结：抓取并总结主流网站网页正文（支持 `github.com`、`v2ex.com`、`linux.do`、`news.ycombinator.com`、`bilibili.com`、`zhihu.com`、`x.com`、`twitter.com`）
 - 番剧下载：从蜜柑 RSS 检索并提交到 aria2，支持按集数/最新一集、字幕组筛选，避免同一集混下不同字幕组
+- 转发查看：读取合并转发节点并输出聊天记录摘要
+- 撤回查看：记录并查看最近撤回的消息文本
 - 直链/种子下载：发送蜜柑链接或 `.torrent` 文件可直接下载
 - 种子预检：下载 `.torrent` 前会按违规关键词和危险文件后缀做拦截
 - 订阅下载：可选启用，支持添加/取消/列表/检查订阅更新
@@ -68,11 +70,10 @@ HISTORY_MAX_MESSAGES=60              # 最大历史条数
 IMAGE_CACHE_MAX_IMAGES=10            # 图片缓存：最多缓存最近 N 张图片（用于防止图片链接过期）
 HISTORY_REFERENCE_ONLY=true          # 仅把历史作为“参考文本”，避免模型继续旧话题
 
-# 聊天三阶段（知识 -> 风格 -> 校验）
+# 聊天（单次调用）
 CHAT_STYLE_STRENGTH=0.35             # 0-1，越高语气越明显
 CHAT_KNOWLEDGE_TEMPERATURE=0.2       # 建议低温，保证事实稳定
 CHAT_STYLE_TEMPERATURE=0.7           # 适中，提升表达自然度
-CHAT_FACT_CHECK_TEMPERATURE=0.1      # 低温，减少校验漂移
 CHAT_FACT_MAX_ITEMS=8                # 事实点上限
 
 # 发送策略
@@ -128,6 +129,8 @@ GEMINI_LOG_RESPONSE=false
 | 天气 <城市> | 查询当前天气 |
 | 网页总结 <网页链接> | 总结主流网站网页正文 |
 | 番剧下载 <关键词/条件> | 检索蜜柑并提交到 aria2 |
+| 查看转发 [条数] | 展开当前消息/回复中的合并转发记录 |
+| 查看撤回 [条数] | 查看最近撤回消息记录 |
 
 ### 示例
 - `Diana帮忙把@向晚头像变成黑白`
@@ -140,6 +143,8 @@ GEMINI_LOG_RESPONSE=false
 - `网页总结 https://www.zhihu.com/question/123456789`
 - `番剧下载 葬送的芙莉莲 最新一集`
 - `番剧下载 葬送的芙莉莲 第31集 北宇治字幕组`
+- `查看转发 15`
+- `查看撤回 10`
 - `https://mikanani.me/Home/Episode/xxxx`
 - `https://mikanani.me/Download/20250101/xxxx.torrent`
 - `（直接发送 .torrent 文件）`

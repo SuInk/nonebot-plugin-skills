@@ -16,7 +16,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import httpx
 from google import genai
 from google.genai import types
-from nonebot import get_driver, logger, on_command, on_message
+from nonebot import get_driver, logger, on_command, on_message, on_notice
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageEvent, MessageSegment
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata
@@ -26,7 +26,7 @@ from .config import config
 __plugin_meta__ = PluginMetadata(
     name="nonebot-plugin-skills",
     description="基于 Gemini 的技能插件，支持图片处理、聊天、天气、网页总结与番剧下载",
-    usage="指令：处理头像 <指令> / 技能|聊天 <内容> / 天气 <城市> / 网页总结 <网页链接> / 番剧下载 <关键词>",
+    usage="指令：处理头像 <指令> / 技能|聊天 <内容> / 天气 <城市> / 网页总结 <网页链接> / 番剧下载 <关键词> / 查看转发 / 查看撤回",
     type="application",
     homepage="https://github.com/yourname/nonebot-plugin-skills",
     supported_adapters={"~onebot.v11"},
@@ -80,6 +80,11 @@ _IMAGE_CACHE_MAX_BYTES = 8 * 1024 * 1024
 _DEFAULT_IMAGE_DOWNLOAD_MAX_BYTES = 15 * 1024 * 1024
 _DEFAULT_WEB_FETCH_MAX_BYTES = 2 * 1024 * 1024
 _DEFAULT_WEB_EXTRACT_MAX_CHARS = 12000
+_FORWARD_FETCH_NODE_LIMIT = 30
+_FORWARD_FETCH_CHAR_LIMIT = 2200
+_FORWARD_PROMPT_NODE_LIMIT = 12
+_FORWARD_PROMPT_CHAR_LIMIT = 1000
+_RECALL_MAX_ITEMS = 100
 
 _WEB_SUMMARY_HOST_LABELS = {
     "github.com": "GitHub",
@@ -151,49 +156,22 @@ _QQ_BOTBR_RULES = (
     "- 不要使用markdown或者html，聊天软件不支持解析，换行请用换行符。\n"
 )
 
-_CHAT_KNOWLEDGE_SYSTEM_PROMPT = (
+_CHAT_SINGLE_SYSTEM_PROMPT = (
     "Role\n"
-    "你是聊天知识起草器。\n"
+    "你是asoul成员嘉然风格的聊天助手，需同时保证事实准确。\n"
     "Goal\n"
-    "只负责准确回答，不负责嘉然风格表达。\n"
+    "一次生成完成知识回答和风格表达。\n"
     "Rules\n"
-    "- 你必须输出单一 JSON 对象，不要输出解释。\n"
-    "- answer 给出对当前消息的直接回复草稿，保持信息完整。\n"
-    "- facts 只保留 answer 里的关键事实，status 只能是 fact/inference/uncertain。\n"
-    "- 若信息不足，need_clarification=true，并在 clarify_question 给出具体追问。\n"
-    "- 输出纯文本内容，不要 Markdown 或 HTML。\n"
-    "Output\n"
-    "{\"action\":\"chat_knowledge\",\"target\":\"reply_draft\",\"params\":{\"answer\":\"string\",\"facts\":[{\"id\":\"F1\",\"content\":\"string\",\"status\":\"fact|inference|uncertain\"}],\"need_clarification\":false,\"clarify_question\":\"string\"}}\n"
-)
-
-_CHAT_STYLE_SYSTEM_PROMPT = (
-    "Role\n"
-    "你是asoul成员嘉然风格改写器。\n"
-    "Goal\n"
-    "把知识草稿改写成嘉然语气，但事实不能变化。\n"
-    "Rules\n"
-    "- 只改语气、称呼、句式，不得增删事实。\n"
-    "- 不得修改数字、时间、专有名词、链接、命令、QQ号、消息ID。\n"
-    "- style_strength 越高，语气越明显；默认保持轻到中等风格。\n"
+    "- 你必须只输出单一 JSON 对象，不要解释。\n"
+    "- answer: 事实版回复（偏严谨，不必有明显风格）。\n"
+    "- reply: 嘉然风格回复（可直接发QQ），不得增删 answer 的事实。\n"
+    "- facts: 列出关键事实，status 只能是 fact/inference/uncertain。\n"
+    "- 若信息不足，need_clarification=true，并输出 clarify_question。\n"
+    "- 不要修改数字、时间、专有名词、链接、命令、QQ号、消息ID。\n"
     "- 输出纯文本，不使用 Markdown 或 HTML。\n"
     f"{_QQ_BOTBR_RULES}"
     "Output\n"
-    "{\"action\":\"chat_style_rewrite\",\"target\":\"reply_text\",\"params\":{\"reply\":\"string\"}}\n"
-)
-
-_CHAT_FACT_CHECK_SYSTEM_PROMPT = (
-    "Role\n"
-    "你是聊天回复事实对齐检查器。\n"
-    "Goal\n"
-    "检查候选回复是否与知识草稿 facts 一致。\n"
-    "Rules\n"
-    "- 逐条核对 facts 与 answer。\n"
-    "- 完全一致时 pass=true。\n"
-    "- 不一致时 pass=false，并给出 fixed_reply（修正后可直接发送）。\n"
-    "- fixed_reply 要尽量保留嘉然语气，但必须以事实正确为最高优先级。\n"
-    "- 只输出 JSON，不要解释。\n"
-    "Output\n"
-    "{\"action\":\"chat_fact_check\",\"target\":\"reply_text\",\"params\":{\"pass\":true,\"fixed_reply\":\"string\",\"issues\":[\"string\"]}}\n"
+    "{\"action\":\"chat\",\"target\":\"user\",\"params\":{\"answer\":\"string\",\"reply\":\"string\",\"facts\":[{\"id\":\"F1\",\"content\":\"string\",\"status\":\"fact|inference|uncertain\"}],\"need_clarification\":false,\"clarify_question\":\"string\"}}\n"
 )
 
 _IMAGE_CHAT_SYSTEM_PROMPT = (
@@ -242,13 +220,14 @@ _INTENT_SYSTEM_PROMPT = (
     "不要输出拒绝/免责声明/权限说明（例如“我无法访问账号”）。"
     "只输出单一 JSON 对象，格式如下："
     "{"
-    "\"action\": \"chat|image_chat|image_generate|image_create|weather|avatar_get|user_info|travel_plan|web_summary|bangumi_download|history_clear|ignore\","
-    "\"target\": \"message_image|reply_image|at_user|last_image|sender_avatar|group_avatar|qq_avatar|sender_user|qq_user|message_id|wait_next|city|trip|url|mikan|none\","
+    "\"action\": \"chat|image_chat|image_generate|image_create|weather|avatar_get|user_info|travel_plan|web_summary|bangumi_download|forward_view|recall_view|history_clear|ignore\","
+    "\"target\": \"message_image|reply_image|at_user|last_image|sender_avatar|group_avatar|qq_avatar|sender_user|qq_user|message_id|wait_next|city|trip|url|mikan|message_forward|reply_forward|recent_recall|none\","
     "\"params\": {\"qq\": \"string\", \"message_id\": \"int\", \"city\": \"string\","
     " \"destination\": \"string\", \"days\": \"int\", \"nights\": \"int\","
     " \"url\": \"string\", \"focus\": \"string\","
     " \"keyword\": \"string\", \"episode\": \"int\", \"latest\": \"bool\","
     " \"uri\": \"string\","
+    " \"count\": \"int\", \"limit\": \"int\","
     " \"subtitle_group\": \"string\", \"mode\": \"download|subscribe|unsubscribe|list|check\","
     " \"subscribe\": \"bool\", \"reply\": \"string\"}"
     "}"
@@ -264,6 +243,10 @@ _INTENT_SYSTEM_PROMPT = (
     "- action=travel_plan：旅行规划；target=trip；params.destination/days/nights 可填则填。"
     "- action=web_summary：网页总结；target=url；params.url 为链接（没有就留空），支持 github.com、v2ex.com、linux.do、news.ycombinator.com、bilibili.com、zhihu.com、x.com、twitter.com，params.focus 可选。"
     "- action=bangumi_download：从蜜柑下载番剧；target=mikan；params.keyword 为番剧名。params.episode 可选，不填时可用 latest=true 下载最新一集。params.subtitle_group 可选。"
+    "- action=forward_view：查看转发聊天记录；target=message_forward 或 reply_forward；params.limit 可选。"
+    "- action=recall_view：查看最近撤回消息；target=recent_recall；params.count 可选。"
+    "- 若当前消息包含转发且用户要求“查看/展开/总结转发”，优先 action=forward_view。"
+    "- 若用户提到“撤回了什么/看撤回消息”，优先 action=recall_view。"
     "- 如果消息是蜜柑链接、.torrent 链接或“种子文件下载”，优先输出 action=bangumi_download，并在 params.uri 填链接（有就填）。"
     "- bangumi_download 的 params.mode：download(默认)/subscribe(订阅并下载)/unsubscribe(取消订阅)/list(查看订阅)/check(检查订阅更新并下载新集)。"
     "- action=history_clear：清除当前会话历史；target=none。"
@@ -628,17 +611,197 @@ async def _resolve_at_display_name(bot: Bot, event: MessageEvent, qq: str) -> st
     return _normalize_user_name(name)
 
 
+def _extract_forward_ids(message: Message) -> List[str]:
+    ids: List[str] = []
+    seen: set[str] = set()
+    for seg in message:
+        if getattr(seg, "type", "") != "forward":
+            continue
+        data = getattr(seg, "data", {}) or {}
+        forward_id = str(data.get("id") or data.get("resid") or "").strip()
+        if not forward_id or forward_id in seen:
+            continue
+        seen.add(forward_id)
+        ids.append(forward_id)
+    return ids
+
+
+def _extract_reply_forward_ids(event: MessageEvent) -> List[str]:
+    reply = getattr(event, "reply", None)
+    if not reply:
+        return []
+    reply_message = getattr(reply, "message", None)
+    if not isinstance(reply_message, Message):
+        return []
+    return _extract_forward_ids(reply_message)
+
+
+def _segment_plain_text(segment: object) -> str:
+    seg_type = ""
+    data: dict[str, object] = {}
+    if isinstance(segment, dict):
+        seg_type = str(segment.get("type") or "")
+        raw_data = segment.get("data")
+        if isinstance(raw_data, dict):
+            data = raw_data
+    else:
+        seg_type = str(getattr(segment, "type", "") or "")
+        raw_data = getattr(segment, "data", None)
+        if isinstance(raw_data, dict):
+            data = raw_data
+    if seg_type == "text":
+        value = data.get("text")
+        return str(value) if value is not None else ""
+    if seg_type == "at":
+        qq = str(data.get("qq") or "").strip()
+        if qq == "all":
+            return "@全体成员"
+        return "@用户" if qq else ""
+    if seg_type == "image":
+        return "[图片]"
+    if seg_type == "face":
+        return "[表情]"
+    if seg_type == "file":
+        return "[文件]"
+    if seg_type == "video":
+        return "[视频]"
+    if seg_type == "record":
+        return "[语音]"
+    if seg_type == "forward":
+        return "[转发聊天记录]"
+    return ""
+
+
+def _message_obj_plain_text(message_obj: object) -> str:
+    if isinstance(message_obj, str):
+        return _sanitize_cq_tokens(message_obj)
+    if isinstance(message_obj, Message):
+        parts = [_segment_plain_text(seg) for seg in message_obj]
+        return _normalize_prompt_text("".join(parts))
+    if isinstance(message_obj, list):
+        parts = [_segment_plain_text(seg) for seg in message_obj]
+        return _normalize_prompt_text("".join(parts))
+    if isinstance(message_obj, dict):
+        if "type" in message_obj:
+            return _normalize_prompt_text(_segment_plain_text(message_obj))
+        msg = message_obj.get("message")
+        if msg is not None:
+            return _message_obj_plain_text(msg)
+        content = message_obj.get("content")
+        if content is not None:
+            return _message_obj_plain_text(content)
+    return ""
+
+
+def _forward_nodes_from_payload(payload: object) -> List[Tuple[str, str]]:
+    if not isinstance(payload, dict):
+        return []
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return []
+    result: List[Tuple[str, str]] = []
+    for node in messages:
+        if not isinstance(node, dict):
+            continue
+        sender = node.get("sender")
+        name = ""
+        if isinstance(sender, dict):
+            name = _normalize_user_name(sender.get("card") or sender.get("nickname"))
+        if not name:
+            name = "用户"
+        content = node.get("content")
+        if content is None:
+            content = node.get("message")
+        text = _message_obj_plain_text(content)
+        text = _normalize_prompt_text(text)
+        if not text:
+            text = "[非文本消息]"
+        result.append((name, text))
+        if len(result) >= _FORWARD_FETCH_NODE_LIMIT:
+            break
+    return result
+
+
+def _format_forward_nodes(
+    nodes: List[Tuple[str, str]],
+    *,
+    limit_nodes: int,
+    limit_chars: int,
+    header: str,
+) -> str:
+    if not nodes:
+        return ""
+    display_nodes = nodes[: max(1, limit_nodes)]
+    lines: List[str] = [header]
+    for idx, (name, text) in enumerate(display_nodes):
+        body = _truncate(text, 220).replace("\n", " ")
+        lines.append(f"{idx + 1}. {name}: {body}")
+    if len(nodes) > len(display_nodes):
+        lines.append(f"...... 还有 {len(nodes) - len(display_nodes)} 条")
+    merged = "\n".join(lines).strip()
+    if len(merged) > limit_chars:
+        merged = merged[: max(50, limit_chars - 20)].rstrip() + "\n...... 内容过长已截断"
+    return merged
+
+
+async def _fetch_forward_nodes(bot: Bot, forward_id: str) -> List[Tuple[str, str]]:
+    if not forward_id:
+        return []
+    try:
+        payload = await asyncio.wait_for(
+            bot.get_forward_msg(id=forward_id),
+            timeout=_request_timeout_seconds(),
+        )
+    except Exception:
+        return []
+    return _forward_nodes_from_payload(payload)
+
+
+async def _build_forward_summary_text(
+    bot: Bot,
+    forward_ids: List[str],
+    *,
+    limit_nodes: int,
+    limit_chars: int,
+    header_prefix: str,
+) -> str:
+    if not forward_ids:
+        return ""
+    tasks = [_fetch_forward_nodes(bot, fid) for fid in forward_ids]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    sections: List[str] = []
+    for idx, result in enumerate(results):
+        if isinstance(result, Exception):
+            continue
+        nodes = result
+        if not nodes:
+            continue
+        header = header_prefix if len(forward_ids) == 1 else f"{header_prefix}{idx + 1}"
+        block = _format_forward_nodes(
+            nodes,
+            limit_nodes=limit_nodes,
+            limit_chars=limit_chars,
+            header=header,
+        )
+        if block:
+            sections.append(block)
+    return "\n\n".join(sections).strip()
+
+
 async def _event_message_text(bot: Bot, event: MessageEvent) -> str:
     """Build a safe text representation of the current message for LLM/tool prompts.
 
     - Preserve @ mentions as @昵称 (best-effort), but never leak QQ numbers.
     - Strip CQ tokens if they appear as literal text.
-    - Ignore non-text segments (images, files, etc.) to avoid leaking URLs/IDs.
+    - Resolve merged-forward segments into plain text summaries.
+    - Ignore other non-text segments (images, files, etc.) to avoid leaking URLs/IDs.
     """
     message = event.get_message()
     parts: List[str] = []
     at_list: List[str] = []
     placeholders: List[str] = []
+    forward_ids: List[str] = []
+    forward_placeholders: List[str] = []
     for seg in message:
         if seg.type == "text":
             parts.append(str(seg.data.get("text") or ""))
@@ -653,6 +816,15 @@ async def _event_message_text(bot: Bot, event: MessageEvent) -> str:
             placeholder = f"__AT_{len(at_list)}__"
             at_list.append(qq)
             placeholders.append(placeholder)
+            parts.append(placeholder)
+            continue
+        if seg.type == "forward":
+            forward_id = str(seg.data.get("id") or seg.data.get("resid") or "").strip()
+            if not forward_id:
+                continue
+            placeholder = f"__FWD_{len(forward_ids)}__"
+            forward_ids.append(forward_id)
+            forward_placeholders.append(placeholder)
             parts.append(placeholder)
             continue
         # Skip other CQ segments to avoid leaking URLs/IDs.
@@ -671,6 +843,25 @@ async def _event_message_text(bot: Bot, event: MessageEvent) -> str:
                 name = value.strip()
             display = name or (f"用户{idx + 1}" if len(at_list) > 1 else "用户")
             text = text.replace(placeholders[idx], f"@{display}")
+    if forward_ids:
+        summary_blocks = await asyncio.gather(
+            *[
+                _build_forward_summary_text(
+                    bot,
+                    [forward_id],
+                    limit_nodes=_FORWARD_PROMPT_NODE_LIMIT,
+                    limit_chars=_FORWARD_PROMPT_CHAR_LIMIT,
+                    header_prefix="转发聊天记录",
+                )
+                for forward_id in forward_ids
+            ],
+            return_exceptions=True,
+        )
+        for idx, block in enumerate(summary_blocks):
+            value = "[转发聊天记录]"
+            if isinstance(block, str) and block.strip():
+                value = block.strip()
+            text = text.replace(forward_placeholders[idx], value)
     text = _sanitize_cq_tokens(text)
     return _normalize_prompt_text(text)
 
@@ -990,6 +1181,16 @@ class CachedImage:
 
 
 @dataclass
+class RecalledMessage:
+    ts: float
+    message_id: int
+    sender_user_id: Optional[str] = None
+    operator_user_id: Optional[str] = None
+    sender_name: Optional[str] = None
+    text: str = ""
+
+
+@dataclass
 class BangumiRelease:
     title: str
     page_url: str
@@ -1017,6 +1218,7 @@ class SessionState:
     pending_image_waiters: dict[str, asyncio.Future[int]]
     handled_message_ids: dict[int, float]
     handled_texts: dict[str, float]
+    recalled_messages: List[RecalledMessage]
     history_lock: asyncio.Lock
     bangumi_episode_group_map: dict[str, dict[int, str]]
 
@@ -1070,6 +1272,7 @@ def _get_state(session_id: str) -> SessionState:
             pending_image_waiters={},
             handled_message_ids={},
             handled_texts={},
+            recalled_messages=[],
             history_lock=asyncio.Lock(),
             bangumi_episode_group_map={},
         )
@@ -1596,11 +1799,6 @@ def _chat_style_temperature() -> float:
     return _clamp_float(value, default=0.7, minimum=0.0, maximum=2.0)
 
 
-def _chat_fact_check_temperature() -> float:
-    value = getattr(config, "chat_fact_check_temperature", 0.1)
-    return _clamp_float(value, default=0.1, minimum=0.0, maximum=2.0)
-
-
 def _chat_fact_max_items() -> int:
     try:
         value = int(getattr(config, "chat_fact_max_items", 8))
@@ -1713,6 +1911,12 @@ def _prune_state(state: SessionState, *, trim_history: bool = True) -> None:
         state.handled_texts = {
             key: ts for key, ts in state.handled_texts.items() if ts >= text_cutoff
         }
+    if state.recalled_messages:
+        state.recalled_messages = [
+            item for item in state.recalled_messages if item.ts >= cutoff
+        ]
+        if len(state.recalled_messages) > _RECALL_MAX_ITEMS:
+            state.recalled_messages = state.recalled_messages[-_RECALL_MAX_ITEMS:]
 
 
 def _clear_session_state(state: SessionState) -> None:
@@ -1731,6 +1935,7 @@ def _clear_session_state(state: SessionState) -> None:
     state.pending_image_waiters = {}
     state.handled_message_ids = {}
     state.handled_texts = {}
+    state.recalled_messages = []
     state.bangumi_episode_group_map = {}
 
 
@@ -4445,99 +4650,56 @@ def _chat_facts_from_payload(raw_facts: object) -> List[dict[str, str]]:
     return normalized
 
 
-def _normalize_chat_knowledge_payload(payload: Optional[dict]) -> Optional[dict]:
+def _normalize_chat_single_payload(payload: Optional[dict]) -> Optional[dict]:
     if not isinstance(payload, dict):
         return None
     action = str(payload.get("action") or "").strip().lower()
     target = str(payload.get("target") or "").strip().lower()
-    if action != "chat_knowledge" or target != "reply_draft":
+    if action != "chat" or target not in {"user", "none"}:
         return None
     params = payload.get("params")
     if not isinstance(params, dict):
         return None
     answer = _format_reply_text(str(params.get("answer") or "").strip())
+    reply = _format_reply_text(str(params.get("reply") or "").strip())
     need_clarification = _coerce_bool(params.get("need_clarification"))
     need_clarification = bool(need_clarification) if need_clarification is not None else False
     clarify_question = _format_reply_text(str(params.get("clarify_question") or "").strip())
     if need_clarification and not clarify_question:
-        clarify_question = "可以先补充一点关键信息吗？"
+        clarify_question = "我先确认一下你的重点问题，可以再具体一点吗？"
     if not answer:
         answer = clarify_question
-    if not answer:
+    if not reply:
+        reply = answer
+    if not answer and not reply:
         return None
     facts = _chat_facts_from_payload(params.get("facts"))
-    if not facts and not _is_skip_reply_text(answer):
+    if not facts and answer and not _is_skip_reply_text(answer):
         facts = [{"id": "F1", "content": answer, "status": "fact"}]
     normalized_params: dict[str, object] = {
         "answer": answer,
+        "reply": reply,
         "facts": facts,
         "need_clarification": need_clarification,
     }
     if clarify_question:
         normalized_params["clarify_question"] = clarify_question
     return {
-        "action": "chat_knowledge",
-        "target": "reply_draft",
+        "action": "chat",
+        "target": "user",
         "params": normalized_params,
     }
 
 
-def _normalize_chat_style_payload(payload: Optional[dict]) -> Optional[str]:
-    if not isinstance(payload, dict):
-        return None
-    action = str(payload.get("action") or "").strip().lower()
-    target = str(payload.get("target") or "").strip().lower()
-    if action != "chat_style_rewrite" or target != "reply_text":
-        return None
-    params = payload.get("params")
-    if not isinstance(params, dict):
-        return None
-    reply = params.get("reply")
-    if not isinstance(reply, str):
-        return None
-    return _format_reply_text(reply)
-
-
-def _normalize_chat_fact_check_payload(payload: Optional[dict]) -> Optional[dict]:
-    if not isinstance(payload, dict):
-        return None
-    action = str(payload.get("action") or "").strip().lower()
-    target = str(payload.get("target") or "").strip().lower()
-    if action != "chat_fact_check" or target != "reply_text":
-        return None
-    params = payload.get("params")
-    if not isinstance(params, dict):
-        return None
-    passed = _coerce_bool(params.get("pass"))
-    if passed is None:
-        return None
-    fixed_reply_raw = params.get("fixed_reply")
-    fixed_reply = ""
-    if isinstance(fixed_reply_raw, str):
-        fixed_reply = _format_reply_text(fixed_reply_raw)
-    issues: List[str] = []
-    raw_issues = params.get("issues")
-    if isinstance(raw_issues, list):
-        for issue in raw_issues:
-            if isinstance(issue, str):
-                cleaned = _collapse_spaces(issue)
-                if cleaned:
-                    issues.append(cleaned)
-                if len(issues) >= 8:
-                    break
-    return {
-        "pass": bool(passed),
-        "fixed_reply": fixed_reply,
-        "issues": issues,
-    }
-
-
-def _build_chat_knowledge_prompt(chat_prompt: str) -> str:
+def _build_chat_single_prompt(chat_prompt: str) -> str:
+    style_strength = _chat_style_strength()
     return "\n".join(
         [
-            "请先生成知识草稿，不要使用嘉然风格。",
-            "输入中包含当前待回复消息(JSON)和参考对话，只需回答当前消息。",
-            "必须输出 action/target/params 完整的单一 JSON 对象。",
+            "请一次性完成聊天回复，输出单一 JSON 对象。",
+            f"style_strength={style_strength:.2f}",
+            "answer 负责事实准确，reply 负责嘉然风格。",
+            "reply 不得增删 answer 的事实，不得改数字/时间/专有名词。",
+            "输入中包含当前待回复消息(JSON)和参考对话，只回答当前消息。",
             "输入开始：",
             chat_prompt,
             "输入结束。",
@@ -4545,38 +4707,54 @@ def _build_chat_knowledge_prompt(chat_prompt: str) -> str:
     )
 
 
-def _build_chat_style_prompt(knowledge: dict) -> str:
-    style_strength = _chat_style_strength()
-    return "\n".join(
-        [
-            "把下面知识草稿改写成嘉然风格回复。",
-            f"style_strength={style_strength:.2f}",
-            "约束：不能增删事实，不能改动数字/时间/专有名词/链接/命令。",
-            "必须输出 action/target/params 完整的单一 JSON 对象。",
-            "知识草稿JSON：",
-            json.dumps(knowledge, ensure_ascii=False),
-        ]
-    )
-
-
-def _build_chat_fact_check_prompt(knowledge: dict, candidate_reply: str) -> str:
-    return "\n".join(
-        [
-            "请做事实对齐检查。",
-            "逐条核对 knowledge.params.facts 与 candidate_reply。",
-            "若一致：pass=true；若不一致：pass=false 并输出 fixed_reply。",
-            "fixed_reply 需要尽量保留嘉然语气，但事实必须与 knowledge 一致。",
-            "必须输出 action/target/params 完整的单一 JSON 对象。",
-            "knowledge JSON：",
-            json.dumps(knowledge, ensure_ascii=False),
-            "candidate_reply：",
-            candidate_reply,
-        ]
-    )
-
-
 def _chat_pipeline_clarify_text() -> str:
     return "我想先确认一下你的重点问题，可以再具体一点吗？"
+
+
+def _extract_critical_fact_tokens(text: str) -> List[str]:
+    if not text:
+        return []
+    patterns = [
+        r"https?://[^\s]+",
+        r"\[(?:AT|REPLY):[^\]]+\]",
+        r"\d{4}[-/年]\d{1,2}(?:[-/月]\d{1,2}日?)?",
+        r"\d+(?:\.\d+)?(?:%|℃|°C|GB|MB|TB|km|m|元|岁|集|天|晚|小时|分钟|点)",
+        r"\d{2,}",
+    ]
+    seen: set[str] = set()
+    tokens: List[str] = []
+    for pattern in patterns:
+        for token in re.findall(pattern, text):
+            value = str(token).strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            tokens.append(value)
+            if len(tokens) >= 24:
+                return tokens
+    return tokens
+
+
+def _reply_preserves_critical_facts(
+    answer: str,
+    reply: str,
+    facts: List[dict[str, str]],
+) -> bool:
+    if not answer or not reply:
+        return False
+    corpus = [answer]
+    for row in facts:
+        if row.get("status") == "fact":
+            corpus.append(row.get("content", ""))
+    tokens: List[str] = []
+    for text in corpus:
+        tokens.extend(_extract_critical_fact_tokens(text))
+    if not tokens:
+        return True
+    for token in tokens:
+        if token and token not in reply:
+            return False
+    return True
 
 
 async def _call_gemini_json_stage(
@@ -4648,68 +4826,40 @@ async def _call_gemini_json_stage(
 
 async def _call_gemini_text(prompt: str, state: SessionState) -> str:
     try:
-        knowledge_payload = await _call_gemini_json_stage(
-            system_prompt=_CHAT_KNOWLEDGE_SYSTEM_PROMPT,
-            prompt=_build_chat_knowledge_prompt(prompt),
+        payload = await _call_gemini_json_stage(
+            system_prompt=_CHAT_SINGLE_SYSTEM_PROMPT,
+            prompt=_build_chat_single_prompt(prompt),
             state=state,
             include_history=True,
             current_label="当前消息",
-            temperature=_chat_knowledge_temperature(),
-            log_name="Gemini chat knowledge",
+            temperature=(_chat_knowledge_temperature() + _chat_style_temperature()) / 2.0,
+            log_name="Gemini chat single",
         )
     except Exception as exc:
-        logger.warning("Chat knowledge stage failed: {}", _safe_error_message(exc))
+        logger.warning("Chat single stage failed: {}", _safe_error_message(exc))
         return _chat_pipeline_clarify_text()
 
-    knowledge = _normalize_chat_knowledge_payload(knowledge_payload)
-    if not knowledge:
-        logger.warning("Chat knowledge stage returned invalid JSON.")
+    chat_payload = _normalize_chat_single_payload(payload)
+    if not chat_payload:
+        logger.warning("Chat single stage returned invalid JSON.")
         return _chat_pipeline_clarify_text()
-    knowledge_answer = str(_intent_params(knowledge).get("answer") or "")
-    knowledge_answer = _finalize_chat_reply(knowledge_answer)
-    if _is_skip_reply_text(knowledge_answer):
-        return knowledge_answer
-
-    try:
-        style_payload = await _call_gemini_json_stage(
-            system_prompt=_CHAT_STYLE_SYSTEM_PROMPT,
-            prompt=_build_chat_style_prompt(knowledge),
-            state=state,
-            include_history=False,
-            current_label="当前消息",
-            temperature=_chat_style_temperature(),
-            log_name="Gemini chat style",
-        )
-    except Exception as exc:
-        logger.warning("Chat style stage failed: {}", _safe_error_message(exc))
-        return knowledge_answer
-    styled_reply = _normalize_chat_style_payload(style_payload) or knowledge_answer
-    styled_reply = _finalize_chat_reply(styled_reply)
-    if _is_skip_reply_text(styled_reply):
-        return styled_reply
-
-    try:
-        fact_check_payload = await _call_gemini_json_stage(
-            system_prompt=_CHAT_FACT_CHECK_SYSTEM_PROMPT,
-            prompt=_build_chat_fact_check_prompt(knowledge, styled_reply),
-            state=state,
-            include_history=False,
-            current_label="当前消息",
-            temperature=_chat_fact_check_temperature(),
-            log_name="Gemini chat fact check",
-        )
-    except Exception as exc:
-        logger.warning("Chat fact check stage failed: {}", _safe_error_message(exc))
-        return knowledge_answer
-    fact_check = _normalize_chat_fact_check_payload(fact_check_payload)
-    if not fact_check:
-        return knowledge_answer
-    if fact_check["pass"]:
-        return styled_reply
-    fixed_reply = _finalize_chat_reply(str(fact_check.get("fixed_reply") or ""))
-    if fixed_reply:
-        return fixed_reply
-    return knowledge_answer
+    params = _intent_params(chat_payload)
+    need_clarification = _coerce_bool(params.get("need_clarification"))
+    clarify_question = _finalize_chat_reply(str(params.get("clarify_question") or ""))
+    if need_clarification:
+        return clarify_question or _chat_pipeline_clarify_text()
+    answer = _finalize_chat_reply(str(params.get("answer") or ""))
+    reply = _finalize_chat_reply(str(params.get("reply") or ""))
+    if _is_skip_reply_text(answer) and _is_skip_reply_text(reply):
+        return ""
+    if _is_skip_reply_text(reply):
+        return answer
+    if _is_skip_reply_text(answer):
+        return reply
+    facts = _chat_facts_from_payload(params.get("facts"))
+    if not _reply_preserves_critical_facts(answer, reply, facts):
+        return answer
+    return reply
 
 
 def _build_travel_prompt(intent: dict, *, raw_text: str = "") -> str:
@@ -5413,6 +5563,7 @@ async def _append_history(
 
 
 history_collector = on_message(priority=99, block=False)
+notice_collector = on_notice(priority=99, block=False)
 nlp_handler = on_message(priority=15, block=False)
 avatar_handler = on_command("处理头像", priority=5)
 chat_handler = on_command("技能", aliases={"聊天", "对话"}, priority=5)
@@ -5429,6 +5580,16 @@ bangumi_handler = on_command(
     aliases={"蜜柑下载", "订阅下载", "番剧订阅", "追番下载"},
     priority=5,
 )
+forward_view_handler = on_command(
+    "查看转发",
+    aliases={"转发记录", "查看合并转发", "查看转发聊天记录"},
+    priority=5,
+)
+recall_view_handler = on_command(
+    "查看撤回",
+    aliases={"撤回记录", "查看撤回消息", "撤回消息"},
+    priority=5,
+)
 
 
 @history_collector.handle()
@@ -5437,7 +5598,7 @@ async def _collect_history(bot: Bot, event: MessageEvent):
     state = _get_state(session_id)
 
     # Keep a safe plaintext record (avoid leaking CQ/QQ ids to external APIs via history).
-    text = _sanitize_cq_tokens(event.get_plaintext().strip())
+    text = await _event_message_text(bot, event)
     image_meta = _extract_first_image_meta(event.get_message())
     if image_meta:
         url, file_id = image_meta
@@ -5464,6 +5625,76 @@ async def _collect_history(bot: Bot, event: MessageEvent):
             ts=_event_ts(event),
             message_id=getattr(event, "message_id", None),
         )
+
+
+def _find_history_by_message_id(state: SessionState, message_id: int) -> Optional[HistoryItem]:
+    for item in reversed(state.history):
+        if item.message_id == message_id:
+            return item
+    return None
+
+
+def _notice_session_id(event: object) -> Optional[str]:
+    group_id = _coerce_int(getattr(event, "group_id", None))
+    if group_id is not None:
+        return f"group:{group_id}"
+    user_id = _coerce_int(getattr(event, "user_id", None))
+    if user_id is not None:
+        return f"private:{user_id}"
+    return None
+
+
+async def _append_recalled_message(state: SessionState, item: RecalledMessage) -> None:
+    async with state.history_lock:
+        state.recalled_messages.append(item)
+        if len(state.recalled_messages) > _RECALL_MAX_ITEMS:
+            state.recalled_messages = state.recalled_messages[-_RECALL_MAX_ITEMS:]
+        _prune_state(state, trim_history=False)
+
+
+def _build_recalled_messages_text(state: SessionState, *, count: int) -> str:
+    if not state.recalled_messages:
+        return "最近没有记录到撤回消息。"
+    size = max(1, min(20, count))
+    rows = state.recalled_messages[-size:]
+    lines = [f"最近撤回消息（最多{size}条）："]
+    for idx, item in enumerate(reversed(rows)):
+        time_text = _format_event_time_text(item.ts)
+        sender = _normalize_user_name(item.sender_name) or "用户"
+        text = _truncate(_collapse_spaces(item.text or ""), 120) or "[无文本内容]"
+        head = f"{idx + 1}. {time_text} {sender}"
+        if item.sender_user_id:
+            head += f"(qq={item.sender_user_id})"
+        lines.append(f"{head}：{text}")
+    return "\n".join(lines)
+
+
+@notice_collector.handle()
+async def _collect_recall_notice(event):
+    notice_type = str(getattr(event, "notice_type", "") or "").strip().lower()
+    if notice_type not in {"group_recall", "friend_recall"}:
+        return
+    session_id = _notice_session_id(event)
+    message_id = _coerce_int(getattr(event, "message_id", None))
+    if not session_id or message_id is None:
+        return
+    state = _get_state(session_id)
+    history_item = _find_history_by_message_id(state, message_id)
+    sender_user_id = str(getattr(event, "user_id", "") or "").strip()
+    operator_user_id = str(getattr(event, "operator_id", "") or "").strip()
+    sender_name = history_item.user_name if history_item else ""
+    text = history_item.text if history_item else ""
+    await _append_recalled_message(
+        state,
+        RecalledMessage(
+            ts=_now(),
+            message_id=message_id,
+            sender_user_id=sender_user_id or (history_item.user_id if history_item else None),
+            operator_user_id=operator_user_id or None,
+            sender_name=sender_name or None,
+            text=text,
+        ),
+    )
 
 
 def _is_command_message(text: str) -> bool:
@@ -5500,6 +5731,14 @@ def _is_command_message(text: str) -> bool:
         "订阅下载",
         "番剧订阅",
         "追番下载",
+        "查看转发",
+        "转发记录",
+        "查看合并转发",
+        "查看转发聊天记录",
+        "查看撤回",
+        "撤回记录",
+        "查看撤回消息",
+        "撤回消息",
     ]
     for prefix in starts:
         if not prefix:
@@ -5963,6 +6202,8 @@ _ALLOWED_ACTIONS = {
     "travel_plan",
     "web_summary",
     "bangumi_download",
+    "forward_view",
+    "recall_view",
     "history_clear",
     "ignore",
 }
@@ -5978,9 +6219,13 @@ _ALLOWED_TARGETS = {
     "qq_user",
     "message_id",
     "wait_next",
+    "city",
     "trip",
     "url",
     "mikan",
+    "message_forward",
+    "reply_forward",
+    "recent_recall",
     "none",
 }
 
@@ -5996,6 +6241,8 @@ def _normalize_intent(
     intent: Optional[dict],
     has_image: bool,
     has_reply_image: bool,
+    has_forward: bool,
+    has_reply_forward: bool,
     at_users: List[str],
     state: SessionState,
 ) -> Optional[dict]:
@@ -6015,6 +6262,43 @@ def _normalize_intent(
 
     if action == "history_clear":
         return {"action": "history_clear", "target": "none", "params": {}}
+
+    if action == "forward_view":
+        if target not in _ALLOWED_TARGETS:
+            target = ""
+        if not target or target == "none":
+            if has_forward:
+                target = "message_forward"
+            elif has_reply_forward:
+                target = "reply_forward"
+            else:
+                target = "message_forward"
+        limit = _coerce_int(params.get("limit"))
+        normalized_params: dict[str, object] = {}
+        if limit is not None and limit > 0:
+            normalized_params["limit"] = min(30, limit)
+        raw_reply = params.get("reply")
+        if isinstance(raw_reply, str) and raw_reply.strip():
+            normalized_params["reply"] = raw_reply.strip()
+        return {
+            "action": action,
+            "target": target,
+            "params": normalized_params,
+        }
+
+    if action == "recall_view":
+        count = _coerce_int(params.get("count"))
+        normalized_params: dict[str, object] = {}
+        if count is not None and count > 0:
+            normalized_params["count"] = min(20, count)
+        raw_reply = params.get("reply")
+        if isinstance(raw_reply, str) and raw_reply.strip():
+            normalized_params["reply"] = raw_reply.strip()
+        return {
+            "action": action,
+            "target": "recent_recall",
+            "params": normalized_params,
+        }
 
     if action == "image_create":
         return {
@@ -6245,6 +6529,8 @@ async def _dispatch_intent(
     *,
     image_url: Optional[str],
     reply_image_url: Optional[str],
+    forward_ids: List[str],
+    reply_forward_ids: List[str],
     at_users: List[str],
     send_func,
 ) -> None:
@@ -6278,6 +6564,8 @@ async def _dispatch_intent(
     raw_message_text = ""
     if action in {
         "chat",
+        "forward_view",
+        "recall_view",
         "weather",
         "travel_plan",
         "web_summary",
@@ -6319,6 +6607,61 @@ async def _dispatch_intent(
             _mark_handled_request(state, event, text)
         except Exception as exc:
             logger.error("NLP chat failed: {}", _safe_error_message(exc))
+        return
+
+    if action == "forward_view":
+        target = str(intent.get("target") or "").lower()
+        params = _intent_params(intent)
+        limit = _coerce_int(params.get("limit"))
+        node_limit = max(1, min(30, limit if limit is not None else _FORWARD_FETCH_NODE_LIMIT))
+        chosen_ids: List[str] = []
+        if target == "message_forward":
+            chosen_ids = forward_ids
+        elif target == "reply_forward":
+            chosen_ids = reply_forward_ids
+        else:
+            chosen_ids = forward_ids or reply_forward_ids
+        if not chosen_ids:
+            await send_func("没有找到可查看的转发聊天记录。")
+            return
+        summary = await _build_forward_summary_text(
+            bot,
+            chosen_ids,
+            limit_nodes=node_limit,
+            limit_chars=_FORWARD_FETCH_CHAR_LIMIT,
+            header_prefix="转发聊天记录",
+        )
+        if not summary:
+            await send_func("转发聊天记录读取失败或内容为空。")
+            return
+        await _append_history(
+            state,
+            "user",
+            f"查看转发：{raw_message_text or text}",
+            user_id=str(event.get_user_id()),
+            user_name=user_name,
+            to_bot=True,
+        )
+        await _append_history(state, "model", summary)
+        await _send_text_response(bot, event, send_func, summary)
+        _mark_handled_request(state, event, text)
+        return
+
+    if action == "recall_view":
+        params = _intent_params(intent)
+        count = _coerce_int(params.get("count"))
+        reply = _build_recalled_messages_text(state, count=count or 5)
+        await _append_history(
+            state,
+            "user",
+            f"查看撤回：{raw_message_text or text}",
+            user_id=str(event.get_user_id()),
+            user_name=user_name,
+            to_bot=True,
+        )
+        await _append_history(state, "model", reply)
+        await _send_text_response(bot, event, send_func, reply)
+        _mark_handled_request(state, event, text)
         return
 
     if action == "weather":
@@ -6702,8 +7045,8 @@ async def _dispatch_intent(
 
 def _clarify_intent_text(has_image: bool) -> str:
     if has_image:
-        return "我没太听懂，你是想聊这张图、处理图片、查天气、查用户信息、旅行规划、网页总结还是番剧下载？"
-    return "我没太听懂，你是想聊天、处理图片、无图生成、查天气、查用户信息、旅行规划、网页总结、番剧下载还是清除历史？"
+        return "我没太听懂，你是想聊这张图、处理图片、查天气、查用户信息、旅行规划、网页总结、番剧下载、查看转发还是查看撤回？"
+    return "我没太听懂，你是想聊天、处理图片、无图生成、查天气、查用户信息、旅行规划、网页总结、番剧下载、查看转发、查看撤回还是清除历史？"
 
 
 _TRAVEL_KEYWORDS = ("旅行", "旅游", "行程", "出行", "游玩")
@@ -6823,6 +7166,8 @@ async def _classify_intent(
     state: SessionState,
     has_image: bool,
     has_reply_image: bool,
+    has_forward: bool,
+    has_reply_forward: bool,
     at_users: List[str],
 ) -> Optional[dict]:
     if not config.google_api_key:
@@ -6833,8 +7178,11 @@ async def _classify_intent(
         f"文本: {text}\n"
         f"消息包含图片: {has_image}\n"
         f"回复里有图片: {has_reply_image}\n"
+        f"消息包含转发: {has_forward}\n"
+        f"回复里有转发: {has_reply_forward}\n"
         f"是否@用户: {bool(at_users)}\n"
         f"是否有最近图片: {bool(state.last_image_id)}\n"
+        f"是否有撤回记录: {bool(state.recalled_messages)}\n"
     )
     config_obj, system_used = _build_generate_config(
         system_instruction=system,
@@ -6861,10 +7209,13 @@ async def _classify_intent(
 async def _handle_natural_language(bot: Bot, event: MessageEvent):
     if not config.nlp_enable:
         return
+    forward_ids = _extract_forward_ids(event.get_message())
     # Avoid leaking CQ/QQ ids to external APIs in intent classification.
     plain_text = _sanitize_cq_tokens(event.get_plaintext().strip())
     hint_text = _build_bangumi_nlp_hint(event.get_message(), plain_text)
     text = plain_text or hint_text
+    if not text and forward_ids:
+        text = "查看转发聊天记录"
     if not text:
         return
     if plain_text and _is_command_message(plain_text):
@@ -6895,28 +7246,57 @@ async def _handle_natural_language(bot: Bot, event: MessageEvent):
                 )
     at_users = _extract_at_users(event.get_message(), event.self_id)
     reply_image_url = _extract_reply_image_url(event, state)
+    reply_forward_ids = _extract_reply_forward_ids(event)
     has_image = image_url is not None
     has_reply_image = reply_image_url is not None
+    has_forward = bool(forward_ids)
+    has_reply_forward = bool(reply_forward_ids)
 
     try:
         primary_text = _build_primary_intent_text(event, state, text)
         intent_raw = await _classify_intent(
-            primary_text, state, has_image, has_reply_image, at_users
+            primary_text,
+            state,
+            has_image,
+            has_reply_image,
+            has_forward,
+            has_reply_forward,
+            at_users,
         )
     except Exception as exc:
         logger.error("Intent classify failed: {}", _safe_error_message(exc))
         return
 
-    intent = _normalize_intent(intent_raw, has_image, has_reply_image, at_users, state)
+    intent = _normalize_intent(
+        intent_raw,
+        has_image,
+        has_reply_image,
+        has_forward,
+        has_reply_forward,
+        at_users,
+        state,
+    )
     if not intent:
         try:
             intent_text = await _build_intent_text(event, state, text)
             if intent_text and intent_text != primary_text:
                 intent_raw = await _classify_intent(
-                    intent_text, state, has_image, has_reply_image, at_users
+                    intent_text,
+                    state,
+                    has_image,
+                    has_reply_image,
+                    has_forward,
+                    has_reply_forward,
+                    at_users,
                 )
                 intent = _normalize_intent(
-                    intent_raw, has_image, has_reply_image, at_users, state
+                    intent_raw,
+                    has_image,
+                    has_reply_image,
+                    has_forward,
+                    has_reply_forward,
+                    at_users,
+                    state,
                 )
         except Exception as exc:
             logger.error("Intent classify failed: {}", _safe_error_message(exc))
@@ -6937,6 +7317,8 @@ async def _handle_natural_language(bot: Bot, event: MessageEvent):
         text,
         image_url=image_url,
         reply_image_url=reply_image_url,
+        forward_ids=forward_ids,
+        reply_forward_ids=reply_forward_ids,
         at_users=at_users,
         send_func=nlp_handler.send,
     )
@@ -6956,6 +7338,7 @@ async def _handle_command_via_intent(
     text = _sanitize_cq_tokens(text)
     session_id = _session_id(event)
     state = _get_state(session_id)
+    forward_ids = _extract_forward_ids(event.get_message())
     image_meta = _extract_first_image_meta(event.get_message())
     image_url = (image_meta[0] or image_meta[1]) if image_meta else None
     if image_meta:
@@ -6971,17 +7354,34 @@ async def _handle_command_via_intent(
                 )
     at_users = _extract_at_users(event.get_message(), event.self_id)
     reply_image_url = _extract_reply_image_url(event, state)
+    reply_forward_ids = _extract_reply_forward_ids(event)
     has_image = image_url is not None
     has_reply_image = reply_image_url is not None
+    has_forward = bool(forward_ids)
+    has_reply_forward = bool(reply_forward_ids)
     try:
         intent_raw = await _classify_intent(
-            text, state, has_image, has_reply_image, at_users
+            text,
+            state,
+            has_image,
+            has_reply_image,
+            has_forward,
+            has_reply_forward,
+            at_users,
         )
     except Exception as exc:
         logger.error("Intent classify failed: {}", _safe_error_message(exc))
         await send_func("意图解析失败，请稍后再试。")
         return
-    intent = _normalize_intent(intent_raw, has_image, has_reply_image, at_users, state)
+    intent = _normalize_intent(
+        intent_raw,
+        has_image,
+        has_reply_image,
+        has_forward,
+        has_reply_forward,
+        at_users,
+        state,
+    )
     if not intent:
         await send_func(_clarify_intent_text(has_image))
         return
@@ -6997,6 +7397,8 @@ async def _handle_command_via_intent(
         text,
         image_url=image_url,
         reply_image_url=reply_image_url,
+        forward_ids=forward_ids,
+        reply_forward_ids=reply_forward_ids,
         at_users=at_users,
         send_func=send_func,
     )
@@ -7091,4 +7493,28 @@ async def handle_bangumi(bot: Bot, event: MessageEvent, args: Message = CommandA
         event,
         text=f"番剧下载 {query}",
         send_func=bangumi_handler.send,
+    )
+
+
+@forward_view_handler.handle()
+async def handle_forward_view(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+    query = args.extract_plain_text().strip()
+    text = f"查看转发 {query}".strip()
+    await _handle_command_via_intent(
+        bot,
+        event,
+        text=text,
+        send_func=forward_view_handler.send,
+    )
+
+
+@recall_view_handler.handle()
+async def handle_recall_view(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+    query = args.extract_plain_text().strip()
+    text = f"查看撤回 {query}".strip()
+    await _handle_command_via_intent(
+        bot,
+        event,
+        text=text,
+        send_func=recall_view_handler.send,
     )
