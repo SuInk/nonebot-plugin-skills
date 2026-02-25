@@ -19,6 +19,11 @@ class Config(BaseModel):
     history_max_messages: int = 60
     image_cache_max_images: int = 10
     history_reference_only: bool = True
+    chat_style_strength: float = 0.35
+    chat_knowledge_temperature: float = 0.2
+    chat_style_temperature: float = 0.7
+    chat_fact_check_temperature: float = 0.1
+    chat_fact_max_items: int = 8
     forward_char_threshold: int = 150
     forward_line_threshold: int = 8
     message_send_delay_sec: float = 0.6
