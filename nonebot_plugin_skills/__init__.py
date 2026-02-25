@@ -884,6 +884,7 @@ async def _send_text_response(
             # message is sent instead of multiple forwarded batches.
             if merged and len(merged) > _forward_char_threshold():
                 normalized = merged
+                parts = [merged]
             else:
                 delay = _message_send_delay_sec()
                 for idx, part in enumerate(parts):
@@ -3585,9 +3586,60 @@ def _notify_target_key(target: BangumiNotifyTarget) -> str:
 
 
 async def _send_text_to_target(bot: Bot, target: BangumiNotifyTarget, text: str) -> None:
-    normalized = _normalize_reply_text(text)
+    normalized = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
+    normalized = _normalize_botbr_markers(normalized)
     if not normalized:
         return
+    if _contains_botbr(normalized):
+        parts = _botbr_send_parts(normalized)
+        if len(parts) > 1:
+            merged = "\n\n".join(parts).strip()
+            if merged and len(merged) > _forward_char_threshold():
+                normalized = merged
+                parts = [merged]
+            else:
+                delay = _message_send_delay_sec()
+                for idx, part in enumerate(parts):
+                    await _send_text_to_target(bot, target, part)
+                    if delay > 0 and idx < len(parts) - 1:
+                        await asyncio.sleep(delay)
+                return
+        if len(parts) == 1:
+            normalized = parts[0]
+        else:
+            return
+    normalized = _normalize_reply_text(normalized)
+    if not normalized:
+        return
+    if len(normalized) > _forward_char_threshold():
+        blocks = _split_by_double_newline(normalized)
+        if not blocks:
+            blocks = [normalized]
+        nickname = _bot_display_name(bot)
+        self_id = _coerce_int(getattr(bot, "self_id", None))
+        if self_id is None:
+            if target.group_id is not None:
+                await bot.call_api("send_group_msg", group_id=target.group_id, message=normalized)
+            elif target.user_id is not None:
+                await bot.call_api("send_private_msg", user_id=target.user_id, message=normalized)
+            return
+        nodes = [
+            MessageSegment.node_custom(
+                user_id=self_id,
+                nickname=nickname,
+                content=block,
+            )
+            for block in blocks
+        ]
+        try:
+            if target.group_id is not None:
+                await bot.send_group_forward_msg(group_id=target.group_id, messages=nodes)
+                return
+            elif target.user_id is not None:
+                await bot.send_private_forward_msg(user_id=target.user_id, messages=nodes)
+                return
+        except Exception:
+            pass
     parts = _botbr_send_parts(normalized)
     if not parts:
         return
