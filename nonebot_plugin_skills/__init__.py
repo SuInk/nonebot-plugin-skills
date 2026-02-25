@@ -158,20 +158,17 @@ _QQ_BOTBR_RULES = (
 
 _CHAT_SINGLE_SYSTEM_PROMPT = (
     "Role\n"
-    "你是asoul成员嘉然风格的聊天助手，需同时保证事实准确。\n"
+    "你是聊天助手，需保证事实准确。\n"
     "Goal\n"
-    "一次生成完成知识回答和风格表达。\n"
+    "直接给出可发送到QQ的自然语言回复。\n"
     "Rules\n"
-    "- 你必须只输出单一 JSON 对象，不要解释。\n"
-    "- answer: 事实版回复（偏严谨，不必有明显风格）。\n"
-    "- reply: 嘉然风格回复（可直接发QQ），不得增删 answer 的事实。\n"
-    "- facts: 列出关键事实，status 只能是 fact/inference/uncertain。\n"
-    "- 若信息不足，need_clarification=true，并输出 clarify_question。\n"
+    "- 只输出最终回复内容，不要 JSON，不要解释。\n"
+    "- 信息不足时，先用一句话追问澄清。\n"
     "- 不要修改数字、时间、专有名词、链接、命令、QQ号、消息ID。\n"
     "- 输出纯文本，不使用 Markdown 或 HTML。\n"
     f"{_QQ_BOTBR_RULES}"
     "Output\n"
-    "{\"action\":\"chat\",\"target\":\"user\",\"params\":{\"answer\":\"string\",\"reply\":\"string\",\"facts\":[{\"id\":\"F1\",\"content\":\"string\",\"status\":\"fact|inference|uncertain\"}],\"need_clarification\":false,\"clarify_question\":\"string\"}}\n"
+    "只输出最终回复内容。\n"
 )
 
 _IMAGE_CHAT_SYSTEM_PROMPT = (
@@ -1791,27 +1788,9 @@ def _clamp_float(
     return number
 
 
-def _chat_style_strength() -> float:
-    value = getattr(config, "chat_style_strength", 0.35)
-    return _clamp_float(value, default=0.35, minimum=0.0, maximum=1.0)
-
-
 def _chat_knowledge_temperature() -> float:
     value = getattr(config, "chat_knowledge_temperature", 0.2)
     return _clamp_float(value, default=0.2, minimum=0.0, maximum=2.0)
-
-
-def _chat_style_temperature() -> float:
-    value = getattr(config, "chat_style_temperature", 0.7)
-    return _clamp_float(value, default=0.7, minimum=0.0, maximum=2.0)
-
-
-def _chat_fact_max_items() -> int:
-    try:
-        value = int(getattr(config, "chat_fact_max_items", 8))
-    except Exception:
-        value = 8
-    return max(1, min(20, value))
 
 
 def _history_item_label(item: HistoryItem) -> str:
@@ -4625,88 +4604,12 @@ def _finalize_chat_reply(text: str) -> str:
     return cleaned
 
 
-def _chat_facts_from_payload(raw_facts: object) -> List[dict[str, str]]:
-    normalized: List[dict[str, str]] = []
-    if not isinstance(raw_facts, list):
-        return normalized
-    for idx, row in enumerate(raw_facts):
-        if not isinstance(row, dict):
-            continue
-        content_raw = row.get("content")
-        if not isinstance(content_raw, str):
-            continue
-        content = _format_reply_text(content_raw)
-        if not content:
-            continue
-        fact_id_raw = str(row.get("id") or f"F{idx + 1}").strip()
-        fact_id = re.sub(r"[^A-Za-z0-9_-]", "", fact_id_raw)
-        if not fact_id:
-            fact_id = f"F{idx + 1}"
-        status = str(row.get("status") or "fact").strip().lower()
-        if status not in {"fact", "inference", "uncertain"}:
-            status = "fact"
-        normalized.append(
-            {
-                "id": fact_id[:24],
-                "content": content,
-                "status": status,
-            }
-        )
-        if len(normalized) >= _chat_fact_max_items():
-            break
-    return normalized
-
-
-def _normalize_chat_single_payload(payload: Optional[dict]) -> Optional[dict]:
-    if not isinstance(payload, dict):
-        return None
-    action = str(payload.get("action") or "").strip().lower()
-    target = str(payload.get("target") or "").strip().lower()
-    if action != "chat" or target not in {"user", "none"}:
-        return None
-    params = payload.get("params")
-    if not isinstance(params, dict):
-        return None
-    answer = _format_reply_text(str(params.get("answer") or "").strip())
-    reply = _format_reply_text(str(params.get("reply") or "").strip())
-    need_clarification = _coerce_bool(params.get("need_clarification"))
-    need_clarification = bool(need_clarification) if need_clarification is not None else False
-    clarify_question = _format_reply_text(str(params.get("clarify_question") or "").strip())
-    if need_clarification and not clarify_question:
-        clarify_question = "我先确认一下你的重点问题，可以再具体一点吗？"
-    if not answer:
-        answer = clarify_question
-    if not reply:
-        reply = answer
-    if not answer and not reply:
-        return None
-    facts = _chat_facts_from_payload(params.get("facts"))
-    if not facts and answer and not _is_skip_reply_text(answer):
-        facts = [{"id": "F1", "content": answer, "status": "fact"}]
-    normalized_params: dict[str, object] = {
-        "answer": answer,
-        "reply": reply,
-        "facts": facts,
-        "need_clarification": need_clarification,
-    }
-    if clarify_question:
-        normalized_params["clarify_question"] = clarify_question
-    return {
-        "action": "chat",
-        "target": "user",
-        "params": normalized_params,
-    }
-
-
 def _build_chat_single_prompt(chat_prompt: str) -> str:
-    style_strength = _chat_style_strength()
     return "\n".join(
         [
-            "请一次性完成聊天回复，输出单一 JSON 对象。",
-            f"style_strength={style_strength:.2f}",
-            "answer 负责事实准确，reply 负责嘉然风格。",
-            "reply 不得增删 answer 的事实，不得改数字/时间/专有名词。",
-            "输入中包含当前待回复消息(JSON)和参考对话，只回答当前消息。",
+            "请直接输出自然语言回复。",
+            "不要输出 JSON。",
+            "输入中包含当前待回复消息和参考对话，只回答当前消息。",
             "输入开始：",
             chat_prompt,
             "输入结束。",
@@ -4718,154 +4621,65 @@ def _chat_pipeline_clarify_text() -> str:
     return "我想先确认一下你的重点问题，可以再具体一点吗？"
 
 
-def _extract_critical_fact_tokens(text: str) -> List[str]:
-    if not text:
-        return []
-    patterns = [
-        r"https?://[^\s]+",
-        r"\[(?:AT|REPLY):[^\]]+\]",
-        r"\d{4}[-/年]\d{1,2}(?:[-/月]\d{1,2}日?)?",
-        r"\d+(?:\.\d+)?(?:%|℃|°C|GB|MB|TB|km|m|元|岁|集|天|晚|小时|分钟|点)",
-        r"\d{2,}",
-    ]
-    seen: set[str] = set()
-    tokens: List[str] = []
-    for pattern in patterns:
-        for token in re.findall(pattern, text):
-            value = str(token).strip()
-            if not value or value in seen:
-                continue
-            seen.add(value)
-            tokens.append(value)
-            if len(tokens) >= 24:
-                return tokens
-    return tokens
-
-
-def _reply_preserves_critical_facts(
-    answer: str,
-    reply: str,
-    facts: List[dict[str, str]],
-) -> bool:
-    if not answer or not reply:
-        return False
-    corpus = [answer]
-    for row in facts:
-        if row.get("status") == "fact":
-            corpus.append(row.get("content", ""))
-    tokens: List[str] = []
-    for text in corpus:
-        tokens.extend(_extract_critical_fact_tokens(text))
-    if not tokens:
-        return True
-    for token in tokens:
-        if token and token not in reply:
-            return False
-    return True
-
-
-async def _call_gemini_json_stage(
-    *,
-    system_prompt: str,
-    prompt: str,
-    state: SessionState,
-    include_history: bool,
-    current_label: str,
-    temperature: float,
-    log_name: str,
-) -> Optional[dict]:
-    client = _get_client()
-    use_history_as_messages = include_history and not _history_reference_only()
-    final_prompt = prompt
-    if include_history and not use_history_as_messages:
-        final_prompt = _wrap_prompt_with_reference(state, prompt, current_label=current_label)
-    if use_history_as_messages:
-        contents = _history_to_gemini(state)
-        contents.append(
-            types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=final_prompt)],
-            )
-        )
-    else:
-        contents = [
-            types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=final_prompt)],
-            )
-        ]
-    config_obj, system_used = _build_generate_config(
-        system_instruction=system_prompt,
-        response_mime_type="application/json",
-        temperature=temperature,
-    )
-    if system_prompt and not system_used:
-        if use_history_as_messages:
-            contents.insert(
-                0,
-                types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text=system_prompt)],
-                ),
-            )
-        else:
-            merged_prompt = f"{system_prompt}\n\n{final_prompt}"
+async def _call_gemini_text(prompt: str, state: SessionState) -> str:
+    try:
+        client = _get_client()
+        chat_prompt = _build_chat_single_prompt(prompt)
+        if _history_reference_only():
+            chat_prompt = _wrap_prompt_with_reference(state, chat_prompt, current_label="当前消息")
             contents = [
                 types.Content(
                     role="user",
-                    parts=[types.Part.from_text(text=merged_prompt)],
+                    parts=[types.Part.from_text(text=chat_prompt)],
                 )
             ]
-    response = await asyncio.wait_for(
-        client.aio.models.generate_content(
-            model=config.gemini_text_model,
-            contents=contents,
-            config=config_obj,
-        ),
-        timeout=config.request_timeout,
-    )
-    if config.gemini_log_response:
-        logger.info("{} response: {}", log_name, _dump_response(response))
-        _log_response_text(f"{log_name} content", response)
-    payload = _extract_json(_extract_response_text(response))
-    return payload if isinstance(payload, dict) else None
-
-
-async def _call_gemini_text(prompt: str, state: SessionState) -> str:
-    try:
-        payload = await _call_gemini_json_stage(
-            system_prompt=_CHAT_SINGLE_SYSTEM_PROMPT,
-            prompt=_build_chat_single_prompt(prompt),
-            state=state,
-            include_history=True,
-            current_label="当前消息",
-            temperature=(_chat_knowledge_temperature() + _chat_style_temperature()) / 2.0,
-            log_name="Gemini chat single",
+        else:
+            contents = _history_to_gemini(state)
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=chat_prompt)],
+                )
+            )
+        config_obj, system_used = _build_generate_config(
+            system_instruction=_CHAT_SINGLE_SYSTEM_PROMPT,
+            temperature=_chat_knowledge_temperature(),
+        )
+        if _CHAT_SINGLE_SYSTEM_PROMPT and not system_used:
+            merged_prompt = f"{_CHAT_SINGLE_SYSTEM_PROMPT}\n\n{chat_prompt}"
+            if _history_reference_only():
+                contents = [
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=merged_prompt)],
+                    )
+                ]
+            else:
+                contents = _history_to_gemini(state)
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=merged_prompt)],
+                    )
+                )
+        response = await asyncio.wait_for(
+            client.aio.models.generate_content(
+                model=config.gemini_text_model,
+                contents=contents,
+                config=config_obj,
+            ),
+            timeout=config.request_timeout,
         )
     except Exception as exc:
         logger.warning("Chat single stage failed: {}", _safe_error_message(exc))
         return _chat_pipeline_clarify_text()
 
-    chat_payload = _normalize_chat_single_payload(payload)
-    if not chat_payload:
-        logger.warning("Chat single stage returned invalid JSON.")
-        return _chat_pipeline_clarify_text()
-    params = _intent_params(chat_payload)
-    need_clarification = _coerce_bool(params.get("need_clarification"))
-    clarify_question = _finalize_chat_reply(str(params.get("clarify_question") or ""))
-    if need_clarification:
-        return clarify_question or _chat_pipeline_clarify_text()
-    answer = _finalize_chat_reply(str(params.get("answer") or ""))
-    reply = _finalize_chat_reply(str(params.get("reply") or ""))
-    if _is_skip_reply_text(answer) and _is_skip_reply_text(reply):
-        return ""
+    if config.gemini_log_response:
+        logger.info("Gemini chat single response: {}", _dump_response(response))
+        _log_response_text("Gemini chat single content", response)
+    reply = _finalize_chat_reply(_extract_response_text(response))
     if _is_skip_reply_text(reply):
-        return answer
-    if _is_skip_reply_text(answer):
-        return reply
-    facts = _chat_facts_from_payload(params.get("facts"))
-    if not _reply_preserves_critical_facts(answer, reply, facts):
-        return answer
+        return _chat_pipeline_clarify_text()
     return reply
 
 
@@ -6150,29 +5964,8 @@ def _build_chat_prompt(
     reply_message_id = getattr(reply_event, "message_id", None) if reply_event else None
     reply_sender_id = getattr(getattr(reply_event, "sender", None), "user_id", None)
 
-    payload: dict[str, object] = {
-        "chat_type": "group" if isinstance(event, GroupMessageEvent) else "private",
-        "sender_nickname": current_name,
-        "sender_user_id": sender_user_id,
-        "message": user_text,
-        "send_time": _format_event_time_text(ts),
-        "capabilities": {
-            "at_syntax": "[AT:QQ号]",
-            "reply_syntax": "[REPLY:消息ID]",
-        },
-    }
-    if msg_id is not None:
-        payload["message_id"] = msg_id
-    if reply_text:
-        reply_payload: dict[str, object] = {
-            "sender_nickname": reply_name or "用户",
-            "message": reply_text,
-        }
-        if isinstance(reply_message_id, int):
-            reply_payload["message_id"] = reply_message_id
-        if reply_sender_id is not None:
-            reply_payload["sender_user_id"] = str(reply_sender_id)
-        payload["reply_to"] = reply_payload
+    chat_type = "群聊" if isinstance(event, GroupMessageEvent) else "私聊"
+    send_time_text = _format_event_time_text(ts)
 
     previous = _collect_context_messages(
         state,
@@ -6184,9 +5977,29 @@ def _build_chat_prompt(
     )
 
     parts = [
-        "当前待回复消息(JSON):",
-        json.dumps(payload, ensure_ascii=False),
+        "当前待回复消息:",
+        f"聊天类型: {chat_type}",
+        f"发送者昵称: {current_name or '用户'}",
+        f"发送者QQ: {sender_user_id}",
+        f"消息内容: {user_text}",
+        "可用语法: [AT:QQ号], [REPLY:消息ID]",
     ]
+    if msg_id is not None:
+        parts.append(f"消息ID: {msg_id}")
+    if send_time_text:
+        parts.append(f"发送时间: {send_time_text}")
+    if reply_text:
+        parts.extend(
+            [
+                "被回复消息:",
+                f"发送者昵称: {reply_name or '用户'}",
+                f"消息内容: {reply_text}",
+            ]
+        )
+        if isinstance(reply_message_id, int):
+            parts.append(f"消息ID: {reply_message_id}")
+        if reply_sender_id is not None:
+            parts.append(f"发送者QQ: {reply_sender_id}")
     if previous:
         parts.extend(
             [
