@@ -10,7 +10,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple, cast
+from typing import Any, List, Optional, Tuple, cast
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
@@ -771,7 +771,7 @@ async def _build_forward_summary_text(
     results = await asyncio.gather(*tasks, return_exceptions=True)
     sections: List[str] = []
     for idx, result in enumerate(results):
-        if isinstance(result, Exception):
+        if isinstance(result, BaseException):
             continue
         nodes = result
         if not nodes:
@@ -881,12 +881,19 @@ async def _send_text_response(
     if _contains_botbr(normalized):
         parts = _botbr_send_parts(normalized)
         if len(parts) > 1:
-            delay = _message_send_delay_sec()
-            for idx, part in enumerate(parts):
-                await _send_text_response(bot, event, send_func, part)
-                if delay > 0 and idx < len(parts) - 1:
-                    await asyncio.sleep(delay)
-            return
+            merged = "\n\n".join(parts).strip()
+            # For <botbr> multi-part replies, use total length before splitting.
+            # If it is already over threshold, keep it merged so only one forward
+            # message is sent instead of multiple forwarded batches.
+            if merged and len(merged) > _forward_char_threshold():
+                normalized = merged
+            else:
+                delay = _message_send_delay_sec()
+                for idx, part in enumerate(parts):
+                    await _send_text_response(bot, event, send_func, part)
+                    if delay > 0 and idx < len(parts) - 1:
+                        await asyncio.sleep(delay)
+                return
         if len(parts) == 1:
             normalized = parts[0]
         else:
@@ -1767,7 +1774,7 @@ def _history_reference_only() -> bool:
 
 
 def _clamp_float(
-    value: object,
+    value: Any,
     *,
     default: float,
     minimum: float,
