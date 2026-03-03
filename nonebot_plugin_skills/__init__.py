@@ -85,6 +85,7 @@ _FORWARD_FETCH_CHAR_LIMIT = 2200
 _FORWARD_PROMPT_NODE_LIMIT = 12
 _FORWARD_PROMPT_CHAR_LIMIT = 1000
 _RECALL_MAX_ITEMS = 100
+_RECALL_SNAPSHOT_MAX_ITEMS = 300
 
 _WEB_SUMMARY_HOST_LABELS = {
     "github.com": "GitHub",
@@ -655,7 +656,7 @@ def _segment_plain_text(segment: object) -> str:
         if qq == "all":
             return "@全体成员"
         return "@用户" if qq else ""
-    if seg_type == "image":
+    if seg_type in {"image", "mface"}:
         return "[图片]"
     if seg_type == "face":
         return "[表情]"
@@ -1197,6 +1198,15 @@ class RecalledMessage:
 
 
 @dataclass
+class RecalledMessageSnapshot:
+    ts: float
+    message_id: int
+    sender_user_id: Optional[str] = None
+    sender_name: Optional[str] = None
+    text: str = ""
+
+
+@dataclass
 class BangumiRelease:
     title: str
     page_url: str
@@ -1225,6 +1235,7 @@ class SessionState:
     handled_message_ids: dict[int, float]
     handled_texts: dict[str, float]
     recalled_messages: List[RecalledMessage]
+    recalled_message_snapshots: dict[int, RecalledMessageSnapshot]
     history_lock: asyncio.Lock
     bangumi_episode_group_map: dict[str, dict[int, str]]
 
@@ -1279,6 +1290,7 @@ def _get_state(session_id: str) -> SessionState:
             handled_message_ids={},
             handled_texts={},
             recalled_messages=[],
+            recalled_message_snapshots={},
             history_lock=asyncio.Lock(),
             bangumi_episode_group_map={},
         )
@@ -1905,6 +1917,26 @@ def _prune_state(state: SessionState, *, trim_history: bool = True) -> None:
         ]
         if len(state.recalled_messages) > _RECALL_MAX_ITEMS:
             state.recalled_messages = state.recalled_messages[-_RECALL_MAX_ITEMS:]
+    if state.recalled_message_snapshots:
+        state.recalled_message_snapshots = {
+            msg_id: item
+            for msg_id, item in state.recalled_message_snapshots.items()
+            if item.ts >= cutoff
+        }
+        if len(state.recalled_message_snapshots) > _RECALL_SNAPSHOT_MAX_ITEMS:
+            keep_ids = {
+                msg_id
+                for msg_id, _ in sorted(
+                    state.recalled_message_snapshots.items(),
+                    key=lambda kv: kv[1].ts,
+                    reverse=True,
+                )[:_RECALL_SNAPSHOT_MAX_ITEMS]
+            }
+            state.recalled_message_snapshots = {
+                msg_id: item
+                for msg_id, item in state.recalled_message_snapshots.items()
+                if msg_id in keep_ids
+            }
 
 
 def _clear_session_state(state: SessionState) -> None:
@@ -1924,6 +1956,7 @@ def _clear_session_state(state: SessionState) -> None:
     state.handled_message_ids = {}
     state.handled_texts = {}
     state.recalled_messages = []
+    state.recalled_message_snapshots = {}
     state.bangumi_episode_group_map = {}
 
 
@@ -5470,17 +5503,32 @@ recall_view_handler = on_command(
 async def _collect_history(bot: Bot, event: MessageEvent):
     session_id = _session_id(event)
     state = _get_state(session_id)
+    message = event.get_message()
+    ts = _event_ts(event)
+    msg_id = getattr(event, "message_id", None)
+    user_name = _event_user_name(event)
+    sender_user_id = str(event.get_user_id())
 
     # Keep a safe plaintext record (avoid leaking CQ/QQ ids to external APIs via history).
     text = await _event_message_text(bot, event)
-    image_meta = _extract_first_image_meta(event.get_message())
+    recalled_snapshot_text = _build_recalled_snapshot_text(message)
+    if isinstance(msg_id, int) and recalled_snapshot_text:
+        await _upsert_recalled_message_snapshot(
+            state,
+            RecalledMessageSnapshot(
+                ts=ts,
+                message_id=msg_id,
+                sender_user_id=sender_user_id,
+                sender_name=user_name or None,
+                text=recalled_snapshot_text,
+            ),
+        )
+    image_meta = _extract_first_image_meta(message)
     if image_meta:
         url, file_id = image_meta
-        msg_id = getattr(event, "message_id", None)
         if isinstance(msg_id, int):
-            ts = _event_ts(event)
             _cache_image_meta(state, msg_id, ts=ts, url=url, file_id=file_id)
-            _notify_pending_image(state, str(event.get_user_id()), msg_id)
+            _notify_pending_image(state, sender_user_id, msg_id)
             task = state.image_cache_tasks.get(msg_id)
             if task is None or task.done():
                 state.image_cache_tasks[msg_id] = asyncio.create_task(
@@ -5488,16 +5536,15 @@ async def _collect_history(bot: Bot, event: MessageEvent):
                 )
 
     if text:
-        user_name = _event_user_name(event)
         await _append_history(
             state,
             "user",
             text,
-            user_id=str(event.get_user_id()),
+            user_id=sender_user_id,
             user_name=user_name,
             to_bot=_should_trigger_nlp(event, text),
-            ts=_event_ts(event),
-            message_id=getattr(event, "message_id", None),
+            ts=ts,
+            message_id=msg_id,
         )
 
 
@@ -5506,6 +5553,43 @@ def _find_history_by_message_id(state: SessionState, message_id: int) -> Optiona
         if item.message_id == message_id:
             return item
     return None
+
+
+def _build_recalled_snapshot_text(message: Message) -> str:
+    parts: List[str] = []
+    for seg in message:
+        text = _segment_plain_text(seg)
+        if text:
+            parts.append(text)
+    return _normalize_prompt_text("".join(parts))
+
+
+async def _upsert_recalled_message_snapshot(
+    state: SessionState, item: RecalledMessageSnapshot
+) -> None:
+    async with state.history_lock:
+        state.recalled_message_snapshots[item.message_id] = item
+        if len(state.recalled_message_snapshots) > _RECALL_SNAPSHOT_MAX_ITEMS:
+            keep_ids = {
+                msg_id
+                for msg_id, _ in sorted(
+                    state.recalled_message_snapshots.items(),
+                    key=lambda kv: kv[1].ts,
+                    reverse=True,
+                )[:_RECALL_SNAPSHOT_MAX_ITEMS]
+            }
+            state.recalled_message_snapshots = {
+                msg_id: snapshot
+                for msg_id, snapshot in state.recalled_message_snapshots.items()
+                if msg_id in keep_ids
+            }
+        _prune_state(state, trim_history=False)
+
+
+def _find_recalled_message_snapshot(
+    state: SessionState, message_id: int
+) -> Optional[RecalledMessageSnapshot]:
+    return state.recalled_message_snapshots.get(message_id)
 
 
 def _notice_session_id(event: object) -> Optional[str]:
@@ -5535,7 +5619,7 @@ def _build_recalled_messages_text(state: SessionState, *, count: int) -> str:
     for idx, item in enumerate(reversed(rows)):
         time_text = _format_event_time_text(item.ts)
         sender = _normalize_user_name(item.sender_name) or "用户"
-        text = _truncate(_collapse_spaces(item.text or ""), 120) or "[无文本内容]"
+        text = _truncate(_normalize_prompt_text(item.text or ""), 120) or "[无可解析内容]"
         head = f"{idx + 1}. {time_text} {sender}"
         if item.sender_user_id:
             head += f"(qq={item.sender_user_id})"
@@ -5554,16 +5638,31 @@ async def _collect_recall_notice(event):
         return
     state = _get_state(session_id)
     history_item = _find_history_by_message_id(state, message_id)
+    snapshot_item = _find_recalled_message_snapshot(state, message_id)
     sender_user_id = str(getattr(event, "user_id", "") or "").strip()
     operator_user_id = str(getattr(event, "operator_id", "") or "").strip()
-    sender_name = history_item.user_name if history_item else ""
-    text = history_item.text if history_item else ""
+    sender_name = ""
+    if history_item and history_item.user_name:
+        sender_name = history_item.user_name
+    elif snapshot_item and snapshot_item.sender_name:
+        sender_name = snapshot_item.sender_name
+    text = ""
+    if snapshot_item and snapshot_item.text:
+        text = snapshot_item.text
+    elif history_item and history_item.text:
+        text = history_item.text
+    resolved_sender_user_id = sender_user_id
+    if not resolved_sender_user_id:
+        if history_item and history_item.user_id:
+            resolved_sender_user_id = history_item.user_id
+        elif snapshot_item and snapshot_item.sender_user_id:
+            resolved_sender_user_id = snapshot_item.sender_user_id
     await _append_recalled_message(
         state,
         RecalledMessage(
             ts=_now(),
             message_id=message_id,
-            sender_user_id=sender_user_id or (history_item.user_id if history_item else None),
+            sender_user_id=resolved_sender_user_id or None,
             operator_user_id=operator_user_id or None,
             sender_name=sender_name or None,
             text=text,
