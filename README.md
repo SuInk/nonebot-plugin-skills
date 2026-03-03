@@ -67,6 +67,8 @@ ARIA2_TIMEOUT=20.0                     # aria2 RPC 调用超时（秒）
 # 会话历史
 HISTORY_TTL_SEC=600                  # 会话状态保留时长
 HISTORY_MAX_MESSAGES=60              # 最大历史条数
+HISTORY_PERSIST_ENABLE=true          # 进程重启后恢复历史（默认开启）
+HISTORY_PERSIST_FILE=data/nonebot_plugin_skills/session_state.json  # 历史持久化文件
 IMAGE_CACHE_MAX_IMAGES=10            # 图片缓存：最多缓存最近 N 张图片（用于防止图片链接过期）
 HISTORY_REFERENCE_ONLY=true          # 仅把历史作为“参考文本”，避免模型继续旧话题
 

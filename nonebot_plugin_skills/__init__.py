@@ -86,6 +86,8 @@ _FORWARD_PROMPT_NODE_LIMIT = 12
 _FORWARD_PROMPT_CHAR_LIMIT = 1000
 _RECALL_MAX_ITEMS = 100
 _RECALL_SNAPSHOT_MAX_ITEMS = 300
+_IMAGE_DESCRIBE_MAX_CHARS = 120
+_IMAGE_DESCRIBE_WAIT_SEC = 2.5
 
 _WEB_SUMMARY_HOST_LABELS = {
     "github.com": "GitHub",
@@ -181,6 +183,21 @@ _IMAGE_CHAT_SYSTEM_PROMPT = (
     "Rules\n"
     "- 只围绕当前图片和当前问题回复，不要补充已回复过的历史话题。\n"
     "- 先说可见事实，再给简短判断或建议；看不清就直接说明不确定。\n"
+    "- 输出纯文本，不使用 Markdown 或代码块。\n"
+    f"{_QQ_BOTBR_RULES}"
+    "Output\n"
+    "只输出最终回复内容。\n"
+)
+
+_IMAGE_DESCRIBE_SYSTEM_PROMPT = (
+    "Role\n"
+    "你是图片内容解析助手。\n"
+    "Goal\n"
+    "输出可直接发到QQ的图片内容描述。\n"
+    "Rules\n"
+    "- 只描述可见内容，不要臆测身份或隐私。\n"
+    "- 若图片含文字，尽量提取关键文字；看不清就明确说看不清。\n"
+    "- 控制在1-2句话，简洁口语化。\n"
     "- 输出纯文本，不使用 Markdown 或代码块。\n"
     f"{_QQ_BOTBR_RULES}"
     "Output\n"
@@ -787,15 +804,26 @@ async def _build_forward_summary_text(
     return "\n\n".join(sections).strip()
 
 
-async def _event_message_text(bot: Bot, event: MessageEvent) -> str:
+async def _event_message_text(
+    bot: Bot,
+    event: MessageEvent,
+    *,
+    state: Optional[SessionState] = None,
+) -> str:
     """Build a safe text representation of the current message for LLM/tool prompts.
 
     - Preserve @ mentions as @昵称 (best-effort), but never leak QQ numbers.
     - Strip CQ tokens if they appear as literal text.
     - Resolve merged-forward segments into plain text summaries.
-    - Ignore other non-text segments (images, files, etc.) to avoid leaking URLs/IDs.
+    - Keep image segments as placeholders (or cached descriptions) without leaking URLs/IDs.
     """
     message = event.get_message()
+    event_message_id = getattr(event, "message_id", None)
+    image_desc = ""
+    if state is not None and isinstance(event_message_id, int):
+        image_desc = _get_cached_image_description(state, event_message_id)
+    image_desc_marker = _image_description_marker(image_desc)
+    used_image_desc = False
     parts: List[str] = []
     at_list: List[str] = []
     placeholders: List[str] = []
@@ -825,6 +853,13 @@ async def _event_message_text(bot: Bot, event: MessageEvent) -> str:
             forward_ids.append(forward_id)
             forward_placeholders.append(placeholder)
             parts.append(placeholder)
+            continue
+        if seg.type in {"image", "mface"}:
+            if image_desc_marker != "[图片]" and not used_image_desc:
+                parts.append(image_desc_marker)
+                used_image_desc = True
+            else:
+                parts.append("[图片]")
             continue
         # Skip other CQ segments to avoid leaking URLs/IDs.
     text = "".join(parts).strip()
@@ -1231,6 +1266,8 @@ class SessionState:
     last_image_id: Optional[int]
     image_cache: dict[int, CachedImage]
     image_cache_tasks: dict[int, asyncio.Task[None]]
+    image_descriptions: dict[int, str]
+    image_description_tasks: dict[int, asyncio.Task[None]]
     pending_image_waiters: dict[str, asyncio.Future[int]]
     handled_message_ids: dict[int, float]
     handled_texts: dict[str, float]
@@ -1245,6 +1282,11 @@ _CLIENT: Optional[genai.Client] = None
 _HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 _BANGUMI_SUBS_LOCK: Optional[asyncio.Lock] = None
 _BANGUMI_DOWNLOAD_TASKS: dict[str, asyncio.Task[None]] = {}
+_SESSIONS_LOADED = False
+_SESSION_PERSIST_DIRTY = False
+_SESSION_PERSIST_TASK: Optional[asyncio.Task[None]] = None
+_SESSION_PERSIST_LOCK: Optional[asyncio.Lock] = None
+_SESSION_PERSIST_VERSION = 1
 
 
 def _bangumi_subs_lock() -> asyncio.Lock:
@@ -1278,7 +1320,310 @@ def _format_event_time_text(ts: float) -> str:
         return ""
 
 
+def _history_persist_enabled() -> bool:
+    try:
+        return bool(getattr(config, "history_persist_enable", True))
+    except Exception:
+        return True
+
+
+def _history_persist_path() -> Path:
+    default_path = "data/nonebot_plugin_skills/session_state.json"
+    raw = str(getattr(config, "history_persist_file", default_path) or "").strip()
+    if not raw:
+        raw = default_path
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    return Path.cwd() / path
+
+
+def _session_persist_lock() -> asyncio.Lock:
+    global _SESSION_PERSIST_LOCK
+    if _SESSION_PERSIST_LOCK is None:
+        _SESSION_PERSIST_LOCK = asyncio.Lock()
+    return _SESSION_PERSIST_LOCK
+
+
+def _coerce_persist_float(value: object) -> Optional[float]:
+    try:
+        if isinstance(value, bool):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _deserialize_history_item(payload: object) -> Optional[HistoryItem]:
+    if not isinstance(payload, dict):
+        return None
+    role = str(payload.get("role") or "").strip().lower()
+    if role not in {"user", "model"}:
+        return None
+    text = str(payload.get("text") or "").strip()
+    ts = _coerce_persist_float(payload.get("ts"))
+    if ts is None:
+        return None
+    user_id = str(payload.get("user_id") or "").strip() or None
+    user_name = _normalize_user_name(payload.get("user_name")) or None
+    message_id = _coerce_int(payload.get("message_id"))
+    return HistoryItem(
+        role=role,
+        text=text,
+        ts=ts,
+        user_id=user_id,
+        user_name=user_name,
+        to_bot=bool(payload.get("to_bot")),
+        message_id=message_id,
+    )
+
+
+def _deserialize_recalled_message(payload: object) -> Optional[RecalledMessage]:
+    if not isinstance(payload, dict):
+        return None
+    message_id = _coerce_int(payload.get("message_id"))
+    ts = _coerce_persist_float(payload.get("ts"))
+    if message_id is None or ts is None:
+        return None
+    sender_user_id = str(payload.get("sender_user_id") or "").strip() or None
+    operator_user_id = str(payload.get("operator_user_id") or "").strip() or None
+    sender_name = _normalize_user_name(payload.get("sender_name")) or None
+    text = str(payload.get("text") or "").strip()
+    return RecalledMessage(
+        ts=ts,
+        message_id=message_id,
+        sender_user_id=sender_user_id,
+        operator_user_id=operator_user_id,
+        sender_name=sender_name,
+        text=text,
+    )
+
+
+def _deserialize_recalled_snapshot(payload: object) -> Optional[RecalledMessageSnapshot]:
+    if not isinstance(payload, dict):
+        return None
+    message_id = _coerce_int(payload.get("message_id"))
+    ts = _coerce_persist_float(payload.get("ts"))
+    if message_id is None or ts is None:
+        return None
+    sender_user_id = str(payload.get("sender_user_id") or "").strip() or None
+    sender_name = _normalize_user_name(payload.get("sender_name")) or None
+    text = str(payload.get("text") or "").strip()
+    return RecalledMessageSnapshot(
+        ts=ts,
+        message_id=message_id,
+        sender_user_id=sender_user_id,
+        sender_name=sender_name,
+        text=text,
+    )
+
+
+def _build_state_from_persist_payload(payload: object) -> Optional[SessionState]:
+    if not isinstance(payload, dict):
+        return None
+    history_items: List[HistoryItem] = []
+    raw_history = payload.get("history")
+    if isinstance(raw_history, list):
+        for raw in raw_history:
+            item = _deserialize_history_item(raw)
+            if item is not None:
+                history_items.append(item)
+
+    recalled_messages: List[RecalledMessage] = []
+    raw_recalled = payload.get("recalled_messages")
+    if isinstance(raw_recalled, list):
+        for raw in raw_recalled:
+            item = _deserialize_recalled_message(raw)
+            if item is not None:
+                recalled_messages.append(item)
+
+    recalled_snapshots: dict[int, RecalledMessageSnapshot] = {}
+    raw_snapshots = payload.get("recalled_message_snapshots")
+    if isinstance(raw_snapshots, list):
+        for raw in raw_snapshots:
+            item = _deserialize_recalled_snapshot(raw)
+            if item is not None:
+                recalled_snapshots[item.message_id] = item
+
+    image_descriptions: dict[int, str] = {}
+    raw_descriptions = payload.get("image_descriptions")
+    if isinstance(raw_descriptions, dict):
+        for key, value in raw_descriptions.items():
+            message_id = _coerce_int(key)
+            if message_id is None:
+                continue
+            text = _normalize_image_description(str(value or ""))
+            if text:
+                image_descriptions[message_id] = text
+
+    if not history_items and not recalled_messages and not recalled_snapshots and not image_descriptions:
+        return None
+
+    state = SessionState(
+        history=history_items,
+        last_image_id=None,
+        image_cache={},
+        image_cache_tasks={},
+        image_descriptions=image_descriptions,
+        image_description_tasks={},
+        pending_image_waiters={},
+        handled_message_ids={},
+        handled_texts={},
+        recalled_messages=recalled_messages,
+        recalled_message_snapshots=recalled_snapshots,
+        history_lock=asyncio.Lock(),
+        bangumi_episode_group_map={},
+    )
+    _prune_state(state, trim_history=True)
+    return state
+
+
+def _load_sessions_from_disk_once() -> None:
+    global _SESSIONS_LOADED
+    if _SESSIONS_LOADED:
+        return
+    _SESSIONS_LOADED = True
+    if not _history_persist_enabled():
+        return
+    path = _history_persist_path()
+    if not path.is_file():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Load persisted session state failed: {}", _safe_error_message(exc))
+        return
+    if not isinstance(data, dict):
+        return
+    sessions = data.get("sessions")
+    if not isinstance(sessions, dict):
+        return
+    loaded = 0
+    for session_id, payload in sessions.items():
+        sid = str(session_id or "").strip()
+        if not sid:
+            continue
+        state = _build_state_from_persist_payload(payload)
+        if state is None:
+            continue
+        _SESSIONS[sid] = state
+        loaded += 1
+    if loaded:
+        logger.info("Loaded persisted sessions: {}", loaded)
+
+
+async def _snapshot_state_for_persist(state: SessionState) -> Optional[dict[str, object]]:
+    async with state.history_lock:
+        _prune_state(state, trim_history=True)
+        if (
+            not state.history
+            and not state.recalled_messages
+            and not state.recalled_message_snapshots
+            and not state.image_descriptions
+        ):
+            return None
+        history_payload: List[dict[str, object]] = []
+        for item in state.history:
+            history_payload.append(
+                {
+                    "role": item.role,
+                    "text": item.text,
+                    "ts": item.ts,
+                    "user_id": item.user_id,
+                    "user_name": item.user_name,
+                    "to_bot": bool(item.to_bot),
+                    "message_id": item.message_id,
+                }
+            )
+        recalled_payload: List[dict[str, object]] = []
+        for item in state.recalled_messages:
+            recalled_payload.append(
+                {
+                    "ts": item.ts,
+                    "message_id": item.message_id,
+                    "sender_user_id": item.sender_user_id,
+                    "operator_user_id": item.operator_user_id,
+                    "sender_name": item.sender_name,
+                    "text": item.text,
+                }
+            )
+        snapshot_payload: List[dict[str, object]] = []
+        for item in state.recalled_message_snapshots.values():
+            snapshot_payload.append(
+                {
+                    "ts": item.ts,
+                    "message_id": item.message_id,
+                    "sender_user_id": item.sender_user_id,
+                    "sender_name": item.sender_name,
+                    "text": item.text,
+                }
+            )
+        return {
+            "history": history_payload,
+            "recalled_messages": recalled_payload,
+            "recalled_message_snapshots": snapshot_payload,
+            "image_descriptions": {
+                str(msg_id): text for msg_id, text in state.image_descriptions.items() if text
+            },
+        }
+
+
+async def _persist_sessions_now() -> None:
+    if not _history_persist_enabled():
+        return
+    path = _history_persist_path()
+    sessions_payload: dict[str, object] = {}
+    for session_id, state in list(_SESSIONS.items()):
+        snapshot = await _snapshot_state_for_persist(state)
+        if snapshot is not None:
+            sessions_payload[session_id] = snapshot
+    payload = {
+        "version": _SESSION_PERSIST_VERSION,
+        "saved_at": _now(),
+        "sessions": sessions_payload,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(path)
+    except Exception as exc:
+        logger.warning("Persist session state failed: {}", _safe_error_message(exc))
+
+
+async def _persist_sessions_worker() -> None:
+    global _SESSION_PERSIST_TASK, _SESSION_PERSIST_DIRTY
+    try:
+        while True:
+            await asyncio.sleep(0.4)
+            if not _SESSION_PERSIST_DIRTY:
+                break
+            _SESSION_PERSIST_DIRTY = False
+            async with _session_persist_lock():
+                await _persist_sessions_now()
+            if not _SESSION_PERSIST_DIRTY:
+                break
+    except Exception as exc:
+        logger.warning("Persist session worker failed: {}", _safe_error_message(exc))
+    finally:
+        _SESSION_PERSIST_TASK = None
+
+
+def _schedule_persist_sessions() -> None:
+    global _SESSION_PERSIST_DIRTY, _SESSION_PERSIST_TASK
+    if not _history_persist_enabled():
+        return
+    _SESSION_PERSIST_DIRTY = True
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _SESSION_PERSIST_TASK is None or _SESSION_PERSIST_TASK.done():
+        _SESSION_PERSIST_TASK = loop.create_task(_persist_sessions_worker())
+
+
 def _get_state(session_id: str) -> SessionState:
+    _load_sessions_from_disk_once()
     state = _SESSIONS.get(session_id)
     if state is None:
         state = SessionState(
@@ -1286,6 +1631,8 @@ def _get_state(session_id: str) -> SessionState:
             last_image_id=None,
             image_cache={},
             image_cache_tasks={},
+            image_descriptions={},
+            image_description_tasks={},
             pending_image_waiters={},
             handled_message_ids={},
             handled_texts={},
@@ -1777,6 +2124,17 @@ async def _close_http_client() -> None:
         _HTTP_CLIENT = None
 
 
+@get_driver().on_shutdown
+async def _flush_session_state() -> None:
+    global _SESSION_PERSIST_DIRTY
+    if not _history_persist_enabled():
+        return
+    _SESSION_PERSIST_DIRTY = True
+    async with _session_persist_lock():
+        await _persist_sessions_now()
+    _SESSION_PERSIST_DIRTY = False
+
+
 def _history_reference_only() -> bool:
     try:
         return bool(getattr(config, "history_reference_only", True))
@@ -1937,6 +2295,29 @@ def _prune_state(state: SessionState, *, trim_history: bool = True) -> None:
                 for msg_id, item in state.recalled_message_snapshots.items()
                 if msg_id in keep_ids
             }
+    valid_message_ids: set[int] = set()
+    if state.image_cache:
+        valid_message_ids.update(int(msg_id) for msg_id in state.image_cache.keys())
+    if state.recalled_message_snapshots:
+        valid_message_ids.update(int(msg_id) for msg_id in state.recalled_message_snapshots.keys())
+    for item in state.history:
+        if isinstance(item.message_id, int):
+            valid_message_ids.add(int(item.message_id))
+    if state.image_descriptions:
+        state.image_descriptions = {
+            msg_id: text
+            for msg_id, text in state.image_descriptions.items()
+            if msg_id in valid_message_ids
+        }
+    if state.image_description_tasks:
+        for msg_id, task in list(state.image_description_tasks.items()):
+            if msg_id not in valid_message_ids:
+                if task and not task.done():
+                    task.cancel()
+                state.image_description_tasks.pop(msg_id, None)
+                continue
+            if task.done():
+                state.image_description_tasks.pop(msg_id, None)
 
 
 def _clear_session_state(state: SessionState) -> None:
@@ -1948,6 +2329,12 @@ def _clear_session_state(state: SessionState) -> None:
             if task and not task.done():
                 task.cancel()
     state.image_cache_tasks = {}
+    state.image_descriptions = {}
+    if state.image_description_tasks:
+        for task in state.image_description_tasks.values():
+            if task and not task.done():
+                task.cancel()
+    state.image_description_tasks = {}
     if state.pending_image_waiters:
         for waiter in state.pending_image_waiters.values():
             if not waiter.done():
@@ -1958,6 +2345,7 @@ def _clear_session_state(state: SessionState) -> None:
     state.recalled_messages = []
     state.recalled_message_snapshots = {}
     state.bangumi_episode_group_map = {}
+    _schedule_persist_sessions()
 
 
 _UNSUPPORTED_IMAGE_EXTS: Tuple[str, ...] = ()
@@ -2069,6 +2457,68 @@ def _cache_image_meta(
     if update_last:
         state.last_image_id = message_id
     _prune_state(state)
+
+
+def _normalize_image_description(text: str) -> str:
+    cleaned = _ensure_plain_text(str(text or ""))
+    cleaned = _normalize_prompt_text(cleaned)
+    cleaned = cleaned.replace("[图片]", " ")
+    cleaned = cleaned.replace("[图片描述:", " ")
+    cleaned = cleaned.replace("]", " ")
+    cleaned = _collapse_spaces(cleaned)
+    if not cleaned:
+        return ""
+    return _truncate(cleaned, _IMAGE_DESCRIBE_MAX_CHARS)
+
+
+def _image_description_marker(description: str) -> str:
+    desc = _normalize_image_description(description)
+    if not desc:
+        return "[图片]"
+    return f"[图片描述: {desc}]"
+
+
+def _inject_image_description(text: str, description: str) -> str:
+    base = _normalize_prompt_text(str(text or ""))
+    marker = _image_description_marker(description)
+    if marker == "[图片]":
+        return base
+    if marker in base:
+        return base
+    if "[图片描述:" in base:
+        return base
+    if "[图片]" in base:
+        return base.replace("[图片]", marker, 1)
+    if not base:
+        return marker
+    return _normalize_prompt_text(f"{base} {marker}")
+
+
+def _get_cached_image_description(state: SessionState, message_id: int) -> str:
+    value = state.image_descriptions.get(int(message_id))
+    if not value:
+        return ""
+    return _normalize_image_description(value)
+
+
+def _apply_image_description_to_state(
+    state: SessionState,
+    *,
+    message_id: int,
+    description: str,
+) -> None:
+    msg_id = int(message_id)
+    normalized = _normalize_image_description(description)
+    if not normalized:
+        return
+    state.image_descriptions[msg_id] = normalized
+    snapshot = state.recalled_message_snapshots.get(msg_id)
+    if snapshot is not None:
+        snapshot.text = _inject_image_description(snapshot.text, normalized)
+    for item in reversed(state.history):
+        if item.message_id == msg_id and item.role == "user":
+            item.text = _inject_image_description(item.text, normalized)
+            break
 
 
 def _extract_at_users(message: Message, self_id: Optional[object]) -> List[str]:
@@ -5264,6 +5714,123 @@ async def _resolve_image_bytes(bot: Bot, state: SessionState, image_ref: str) ->
     return await _download_image_bytes_ref(bot, image_ref)
 
 
+def _image_describe_timeout_seconds() -> float:
+    try:
+        value = float(getattr(config, "image_timeout", 120.0))
+    except Exception:
+        value = 120.0
+    if value <= 0:
+        value = 120.0
+    return min(30.0, value)
+
+
+async def _call_gemini_image_describe(
+    bot: Bot,
+    state: SessionState,
+    image_ref: str,
+) -> str:
+    client = _get_client()
+    content_type, image_bytes = await _resolve_image_bytes(bot, state, image_ref)
+    prompt = (
+        "请描述这张图片的主体内容与关键信息。"
+        "若有文字请尽量提取，若看不清请直接说明。"
+    )
+    config_obj, system_used = _build_generate_config(
+        system_instruction=_IMAGE_DESCRIBE_SYSTEM_PROMPT,
+        response_modalities=["TEXT"],
+    )
+    contents: List[types.Content] = []
+    if _IMAGE_DESCRIBE_SYSTEM_PROMPT and not system_used:
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=_IMAGE_DESCRIBE_SYSTEM_PROMPT)],
+            )
+        )
+    contents.append(
+        types.Content(
+            role="user",
+            parts=[
+                types.Part.from_text(text=prompt),
+                types.Part.from_bytes(data=image_bytes, mime_type=content_type),
+            ],
+        )
+    )
+    response = await asyncio.wait_for(
+        client.aio.models.generate_content(
+            model=config.gemini_image_model,
+            contents=contents,
+            config=config_obj,
+        ),
+        timeout=_image_describe_timeout_seconds(),
+    )
+    if config.gemini_log_response:
+        logger.info("Gemini image describe response: {}", _dump_response(response))
+        _log_response_text("Gemini image describe content", response)
+    return _normalize_image_description(_extract_response_text(response))
+
+
+async def _describe_cached_image_task(bot: Bot, state: SessionState, message_id: int) -> None:
+    msg_id = int(message_id)
+    try:
+        description = await _call_gemini_image_describe(bot, state, _cache_image_ref(msg_id))
+        if not description:
+            return
+        async with state.history_lock:
+            _apply_image_description_to_state(
+                state,
+                message_id=msg_id,
+                description=description,
+            )
+            _prune_state(state, trim_history=False)
+        _schedule_persist_sessions()
+    except Exception as exc:
+        logger.debug(
+            "Image describe failed message_id={}: {}",
+            msg_id,
+            _safe_error_message(exc),
+        )
+    finally:
+        task = state.image_description_tasks.get(msg_id)
+        if task is not None and task.done():
+            state.image_description_tasks.pop(msg_id, None)
+
+
+def _ensure_image_description_task(bot: Bot, state: SessionState, message_id: int) -> None:
+    if not config.google_api_key:
+        return
+    msg_id = int(message_id)
+    if _get_cached_image_description(state, msg_id):
+        return
+    task = state.image_description_tasks.get(msg_id)
+    if task is not None and not task.done():
+        return
+    state.image_description_tasks[msg_id] = asyncio.create_task(
+        _describe_cached_image_task(bot, state, msg_id)
+    )
+
+
+async def _wait_image_description(
+    bot: Bot,
+    state: SessionState,
+    message_id: int,
+    *,
+    timeout_sec: float = _IMAGE_DESCRIBE_WAIT_SEC,
+) -> str:
+    msg_id = int(message_id)
+    cached = _get_cached_image_description(state, msg_id)
+    if cached:
+        return cached
+    _ensure_image_description_task(bot, state, msg_id)
+    task = state.image_description_tasks.get(msg_id)
+    if task is not None and not task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=max(0.2, timeout_sec))
+        except Exception:
+            pass
+    return _get_cached_image_description(state, msg_id)
+
+
 async def _call_gemini_image(
     bot: Bot, prompt: str, image_ref: str, state: SessionState
 ) -> Tuple[bool, str]:
@@ -5467,6 +6034,7 @@ async def _append_history(
             )
         )
         _prune_state(state)
+    _schedule_persist_sessions()
 
 
 history_collector = on_message(priority=99, block=False)
@@ -5510,8 +6078,14 @@ async def _collect_history(bot: Bot, event: MessageEvent):
     sender_user_id = str(event.get_user_id())
 
     # Keep a safe plaintext record (avoid leaking CQ/QQ ids to external APIs via history).
-    text = await _event_message_text(bot, event)
-    recalled_snapshot_text = _build_recalled_snapshot_text(message)
+    text = await _event_message_text(bot, event, state=state)
+    cached_desc = ""
+    if isinstance(msg_id, int):
+        cached_desc = _get_cached_image_description(state, msg_id)
+    recalled_snapshot_text = _build_recalled_snapshot_text(
+        message,
+        image_description=cached_desc,
+    )
     if isinstance(msg_id, int) and recalled_snapshot_text:
         await _upsert_recalled_message_snapshot(
             state,
@@ -5534,15 +6108,19 @@ async def _collect_history(bot: Bot, event: MessageEvent):
                 state.image_cache_tasks[msg_id] = asyncio.create_task(
                     _prefetch_cached_image(bot, state, msg_id)
                 )
+            _ensure_image_description_task(bot, state, msg_id)
 
-    if text:
+    history_text = text
+    if not history_text and recalled_snapshot_text:
+        history_text = recalled_snapshot_text
+    if history_text:
         await _append_history(
             state,
             "user",
-            text,
+            history_text,
             user_id=sender_user_id,
             user_name=user_name,
-            to_bot=_should_trigger_nlp(event, text),
+            to_bot=_should_trigger_nlp(event, history_text),
             ts=ts,
             message_id=msg_id,
         )
@@ -5555,9 +6133,19 @@ def _find_history_by_message_id(state: SessionState, message_id: int) -> Optiona
     return None
 
 
-def _build_recalled_snapshot_text(message: Message) -> str:
+def _build_recalled_snapshot_text(message: Message, *, image_description: str = "") -> str:
+    desc_marker = _image_description_marker(image_description)
+    used_image_desc = False
     parts: List[str] = []
     for seg in message:
+        seg_type = str(getattr(seg, "type", "") or "")
+        if seg_type in {"image", "mface"}:
+            if desc_marker != "[图片]" and not used_image_desc:
+                parts.append(desc_marker)
+                used_image_desc = True
+            else:
+                parts.append("[图片]")
+            continue
         text = _segment_plain_text(seg)
         if text:
             parts.append(text)
@@ -5584,6 +6172,7 @@ async def _upsert_recalled_message_snapshot(
                 if msg_id in keep_ids
             }
         _prune_state(state, trim_history=False)
+    _schedule_persist_sessions()
 
 
 def _find_recalled_message_snapshot(
@@ -5608,18 +6197,48 @@ async def _append_recalled_message(state: SessionState, item: RecalledMessage) -
         if len(state.recalled_messages) > _RECALL_MAX_ITEMS:
             state.recalled_messages = state.recalled_messages[-_RECALL_MAX_ITEMS:]
         _prune_state(state, trim_history=False)
+    _schedule_persist_sessions()
 
 
-def _build_recalled_messages_text(state: SessionState, *, count: int) -> str:
+async def _build_recalled_messages_text(bot: Bot, state: SessionState, *, count: int) -> str:
     if not state.recalled_messages:
         return "最近没有记录到撤回消息。"
     size = max(1, min(20, count))
     rows = state.recalled_messages[-size:]
     lines = [f"最近撤回消息（最多{size}条）："]
-    for idx, item in enumerate(reversed(rows)):
+    display_rows = list(reversed(rows))
+    need_desc_ids: List[int] = []
+    for item in display_rows:
+        raw_text = _normalize_prompt_text(item.text or "")
+        if isinstance(item.message_id, int) and "[图片]" in raw_text:
+            need_desc_ids.append(int(item.message_id))
+    desc_map: dict[int, str] = {}
+    if need_desc_ids:
+        unique_ids = list(dict.fromkeys(need_desc_ids))
+        desc_values = await asyncio.gather(
+            *[
+                _wait_image_description(
+                    bot,
+                    state,
+                    msg_id,
+                    timeout_sec=1.0,
+                )
+                for msg_id in unique_ids
+            ],
+            return_exceptions=True,
+        )
+        for msg_id, desc in zip(unique_ids, desc_values):
+            if isinstance(desc, str) and desc:
+                desc_map[msg_id] = desc
+    for idx, item in enumerate(display_rows):
         time_text = _format_event_time_text(item.ts)
         sender = _normalize_user_name(item.sender_name) or "用户"
-        text = _truncate(_normalize_prompt_text(item.text or ""), 120) or "[无可解析内容]"
+        raw_text = _normalize_prompt_text(item.text or "")
+        if isinstance(item.message_id, int) and "[图片]" in raw_text:
+            desc = desc_map.get(int(item.message_id), "")
+            if desc:
+                raw_text = _inject_image_description(raw_text, desc)
+        text = _truncate(_normalize_prompt_text(raw_text), 120) or "[无可解析内容]"
         head = f"{idx + 1}. {time_text} {sender}"
         if item.sender_user_id:
             head += f"(qq={item.sender_user_id})"
@@ -5628,7 +6247,7 @@ def _build_recalled_messages_text(state: SessionState, *, count: int) -> str:
 
 
 @notice_collector.handle()
-async def _collect_recall_notice(event):
+async def _collect_recall_notice(bot: Bot, event):
     notice_type = str(getattr(event, "notice_type", "") or "").strip().lower()
     if notice_type not in {"group_recall", "friend_recall"}:
         return
@@ -5651,6 +6270,10 @@ async def _collect_recall_notice(event):
         text = snapshot_item.text
     elif history_item and history_item.text:
         text = history_item.text
+    if "[图片]" in text and isinstance(message_id, int):
+        desc = await _wait_image_description(bot, state, int(message_id), timeout_sec=0.5)
+        if desc:
+            text = _inject_image_description(text, desc)
     resolved_sender_user_id = sender_user_id
     if not resolved_sender_user_id:
         if history_item and history_item.user_id:
@@ -5775,13 +6398,31 @@ def _extract_reply_context(
     if reply_id is not None:
         for item in reversed(state.history):
             if item.message_id == reply_id:
-                return item.text, (item.user_name or None)
+                text = item.text
+                if isinstance(reply_id, int):
+                    desc = _get_cached_image_description(state, reply_id)
+                    if desc:
+                        text = _inject_image_description(text, desc)
+                return text, (item.user_name or None)
+        if isinstance(reply_id, int):
+            snapshot = _find_recalled_message_snapshot(state, reply_id)
+            if snapshot and snapshot.text:
+                text = snapshot.text
+                desc = _get_cached_image_description(state, reply_id)
+                if desc:
+                    text = _inject_image_description(text, desc)
+                if text:
+                    return text, (snapshot.sender_name or None)
     reply_message = getattr(reply, "message", None)
     if reply_message:
+        text = None
         try:
-            text = reply_message.extract_plain_text().strip()
+            text = _normalize_prompt_text(reply_message.extract_plain_text().strip())
         except Exception:
             text = None
+        if (not text) and isinstance(reply_id, int):
+            desc = _get_cached_image_description(state, reply_id)
+            text = _build_recalled_snapshot_text(reply_message, image_description=desc)
         if text:
             sender_name = _sender_user_name(getattr(reply, "sender", None))
             return text, sender_name or None
@@ -6547,7 +7188,7 @@ async def _dispatch_intent(
         "image_chat",
         "image_generate",
     }:
-        raw_message_text = await _event_message_text(bot, event)
+        raw_message_text = await _event_message_text(bot, event, state=state)
 
     if action == "chat":
         # 普通聊天（文本）
@@ -6622,7 +7263,7 @@ async def _dispatch_intent(
     if action == "recall_view":
         params = _intent_params(intent)
         count = _coerce_int(params.get("count"))
-        reply = _build_recalled_messages_text(state, count=count or 5)
+        reply = await _build_recalled_messages_text(bot, state, count=count or 5)
         await _append_history(
             state,
             "user",
@@ -7181,15 +7822,14 @@ async def _classify_intent(
 async def _handle_natural_language(bot: Bot, event: MessageEvent):
     if not config.nlp_enable:
         return
-    forward_ids = _extract_forward_ids(event.get_message())
+    message = event.get_message()
+    forward_ids = _extract_forward_ids(message)
     # Avoid leaking CQ/QQ ids to external APIs in intent classification.
     plain_text = _sanitize_cq_tokens(event.get_plaintext().strip())
-    hint_text = _build_bangumi_nlp_hint(event.get_message(), plain_text)
+    hint_text = _build_bangumi_nlp_hint(message, plain_text)
     text = plain_text or hint_text
     if not text and forward_ids:
         text = "查看转发聊天记录"
-    if not text:
-        return
     if plain_text and _is_command_message(plain_text):
         return
     if str(event.get_user_id()) == str(event.self_id):
@@ -7201,9 +7841,7 @@ async def _handle_natural_language(bot: Bot, event: MessageEvent):
 
     session_id = _session_id(event)
     state = _get_state(session_id)
-    if _is_duplicate_request(state, event, text):
-        return
-    image_meta = _extract_first_image_meta(event.get_message())
+    image_meta = _extract_first_image_meta(message)
     image_url = (image_meta[0] or image_meta[1]) if image_meta else None
     if image_meta:
         url, file_id = image_meta
@@ -7216,7 +7854,18 @@ async def _handle_natural_language(bot: Bot, event: MessageEvent):
                 state.image_cache_tasks[msg_id] = asyncio.create_task(
                     _prefetch_cached_image(bot, state, msg_id)
                 )
-    at_users = _extract_at_users(event.get_message(), event.self_id)
+            _ensure_image_description_task(bot, state, msg_id)
+            if not text:
+                desc = await _wait_image_description(bot, state, msg_id, timeout_sec=1.2)
+                if desc:
+                    text = f"图片内容：{desc}"
+                else:
+                    text = "图片内容：[图片]"
+    if not text:
+        return
+    if _is_duplicate_request(state, event, text):
+        return
+    at_users = _extract_at_users(message, event.self_id)
     reply_image_url = _extract_reply_image_url(event, state)
     reply_forward_ids = _extract_reply_forward_ids(event)
     has_image = image_url is not None
@@ -7310,8 +7959,9 @@ async def _handle_command_via_intent(
     text = _sanitize_cq_tokens(text)
     session_id = _session_id(event)
     state = _get_state(session_id)
-    forward_ids = _extract_forward_ids(event.get_message())
-    image_meta = _extract_first_image_meta(event.get_message())
+    message = event.get_message()
+    forward_ids = _extract_forward_ids(message)
+    image_meta = _extract_first_image_meta(message)
     image_url = (image_meta[0] or image_meta[1]) if image_meta else None
     if image_meta:
         url, file_id = image_meta
@@ -7324,7 +7974,8 @@ async def _handle_command_via_intent(
                 state.image_cache_tasks[msg_id] = asyncio.create_task(
                     _prefetch_cached_image(bot, state, msg_id)
                 )
-    at_users = _extract_at_users(event.get_message(), event.self_id)
+            _ensure_image_description_task(bot, state, msg_id)
+    at_users = _extract_at_users(message, event.self_id)
     reply_image_url = _extract_reply_image_url(event, state)
     reply_forward_ids = _extract_reply_forward_ids(event)
     has_image = image_url is not None

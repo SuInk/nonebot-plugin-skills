@@ -17,6 +17,8 @@ class Config(BaseModel):
     web_extract_max_chars: int = 12000
     history_ttl_sec: int = 600
     history_max_messages: int = 60
+    history_persist_enable: bool = True
+    history_persist_file: str = "data/nonebot_plugin_skills/session_state.json"
     image_cache_max_images: int = 10
     history_reference_only: bool = True
     chat_style_strength: float = 0.35
