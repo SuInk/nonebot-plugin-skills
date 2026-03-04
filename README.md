@@ -5,6 +5,7 @@
 ## 功能
 - 处理头像/图片：命令内带图、@某人头像、或使用最近聊天图片
 - 聊天对话：带上下文的自然语言聊天
+- 群成员记忆：按会话记录每位成员的长期记忆（写入持久化文件），支持“记住”和“查记忆”
 - 单次调用聊天：一次生成事实答案与嘉然风格回复，事实冲突时自动回退到事实版
 - 天气查询：输入城市/地区即可查询当前天气
 - 网页总结：抓取并总结主流网站网页正文（支持 `github.com`、`v2ex.com`、`linux.do`、`news.ycombinator.com`、`bilibili.com`、`zhihu.com`、`x.com`、`twitter.com`）
@@ -68,8 +69,11 @@ ARIA2_TIMEOUT=20.0                     # aria2 RPC 调用超时（秒）
 HISTORY_TTL_SEC=600                  # 会话状态保留时长
 HISTORY_MAX_MESSAGES=60              # 最大历史条数
 HISTORY_PERSIST_ENABLE=true          # 进程重启后恢复历史（默认开启）
-HISTORY_PERSIST_FILE=data/nonebot_plugin_skills/session_state.json  # 历史持久化文件
+HISTORY_PERSIST_FILE=data/nonebot_plugin_skills/session_state.json  # 历史/记忆持久化文件
 IMAGE_CACHE_MAX_IMAGES=10            # 图片缓存：最多缓存最近 N 张图片（用于防止图片链接过期）
+MEMORY_MAX_USERS_PER_SESSION=500     # 每个会话最多保留多少个成员的记忆
+MEMORY_MAX_ITEMS_PER_USER=30         # 每个成员最多保留多少条记忆
+MEMORY_ITEM_MAX_CHARS=120            # 单条记忆最大字符数
 HISTORY_REFERENCE_ONLY=true          # 仅把历史作为“参考文本”，避免模型继续旧话题
 
 # 聊天（单次调用）
@@ -128,6 +132,7 @@ GEMINI_LOG_RESPONSE=false
 | 处理头像 <指令> | 处理头像/最近图片/@用户头像 |
 | 聊天 <内容> | 上下文聊天 |
 | 技能 <内容> | 上下文聊天 |
+| 记忆 <内容> | 记录/查询群成员记忆（也可用“记住/查记忆/查看记忆”） |
 | 天气 <城市> | 查询当前天气 |
 | 网页总结 <网页链接> | 总结主流网站网页正文 |
 | 番剧下载 <关键词/条件> | 检索蜜柑并提交到 aria2 |
@@ -139,6 +144,9 @@ GEMINI_LOG_RESPONSE=false
 - `处理头像 变成赛博朋克风`
 - `处理头像 @小明 变成油画风`
 - `聊天 你还记得刚才的头像吗？`
+- `记住 我喜欢热美式`
+- `查记忆 我`
+- `查看记忆 @小明`
 - `天气 上海`
 - `网页总结 https://github.com/owner/repo`
 - `网页总结 https://linux.do/t/topic/12345 重点看结论和待办`

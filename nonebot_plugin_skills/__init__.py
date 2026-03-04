@@ -25,8 +25,8 @@ from .config import config
 
 __plugin_meta__ = PluginMetadata(
     name="nonebot-plugin-skills",
-    description="基于 Gemini 的技能插件，支持图片处理、聊天、天气、网页总结与番剧下载",
-    usage="指令：处理头像 <指令> / 技能|聊天 <内容> / 天气 <城市> / 网页总结 <网页链接> / 番剧下载 <关键词> / 查看转发 / 查看撤回",
+    description="基于 Gemini 的技能插件，支持图片处理、聊天、记忆、天气、网页总结与番剧下载",
+    usage="指令：处理头像 <指令> / 技能|聊天 <内容> / 记忆|记住 <内容> / 天气 <城市> / 网页总结 <网页链接> / 番剧下载 <关键词> / 查看转发 / 查看撤回",
     type="application",
     homepage="https://github.com/yourname/nonebot-plugin-skills",
     supported_adapters={"~onebot.v11"},
@@ -88,6 +88,10 @@ _RECALL_MAX_ITEMS = 100
 _RECALL_SNAPSHOT_MAX_ITEMS = 300
 _IMAGE_DESCRIBE_MAX_CHARS = 120
 _IMAGE_DESCRIBE_WAIT_SEC = 2.5
+_MEMORY_MAX_USERS_PER_SESSION = 500
+_MEMORY_MAX_ITEMS_PER_USER = 30
+_MEMORY_QUERY_MAX_ITEMS = 10
+_MEMORY_ITEM_MAX_CHARS = 120
 
 _WEB_SUMMARY_HOST_LABELS = {
     "github.com": "GitHub",
@@ -236,31 +240,35 @@ _INTENT_SYSTEM_PROMPT = (
     "不要输出拒绝/免责声明/权限说明（例如“我无法访问账号”）。"
     "只输出单一 JSON 对象，格式如下："
     "{"
-    "\"action\": \"chat|image_chat|image_generate|image_create|weather|avatar_get|user_info|travel_plan|web_summary|bangumi_download|forward_view|recall_view|history_clear|ignore\","
+    "\"action\": \"chat|image_chat|image_generate|image_create|weather|avatar_get|user_info|memory_record|memory_view|travel_plan|web_summary|bangumi_download|forward_view|recall_view|history_clear|ignore\","
     "\"target\": \"message_image|reply_image|at_user|last_image|sender_avatar|group_avatar|qq_avatar|sender_user|qq_user|message_id|wait_next|city|trip|url|mikan|message_forward|reply_forward|recent_recall|none\","
     "\"params\": {\"qq\": \"string\", \"message_id\": \"int\", \"city\": \"string\","
     " \"destination\": \"string\", \"days\": \"int\", \"nights\": \"int\","
     " \"url\": \"string\", \"focus\": \"string\","
     " \"keyword\": \"string\", \"episode\": \"int\", \"latest\": \"bool\","
     " \"uri\": \"string\","
-    " \"count\": \"int\", \"limit\": \"int\","
+    " \"memory\": \"string\", \"count\": \"int\", \"limit\": \"int\","
     " \"subtitle_group\": \"string\", \"mode\": \"download|subscribe|unsubscribe|list|check\","
     " \"subscribe\": \"bool\", \"reply\": \"string\"}"
     "}"
     "规则："
     "- action=ignore：target=none，params={}。"
-    "- action=chat：普通聊天；target=none。"
+    "- action=chat：普通聊天；target=none。若消息里有稳定且可长期记忆的个人信息，可在 params.memory 填一句话记忆。"
     "- action=image_chat：聊这张图（不生成图）；target 用于选图：message_image/reply_image/at_user/last_image/sender_avatar/group_avatar/qq_avatar/message_id/wait_next。"
     "- action=image_generate：基于参考图生成/编辑；target 用于选图：同上。"
     "- action=image_create：无参考图生成；target=none。"
     "- action=weather：查询天气；target=city；params.city 为地点（没有就留空）。"
     "- action=avatar_get：获取头像；target 可为 sender_avatar/group_avatar/qq_avatar/at_user；target=qq_avatar 时填 params.qq。"
     "- action=user_info：查询用户信息；target 可为 sender_user/at_user/qq_user；target=qq_user 时填 params.qq。"
+    "- action=memory_record：新增或更新记忆；target 可为 sender_user/at_user/qq_user；params.memory 必填。"
+    "- action=memory_view：查询记忆；target 可为 sender_user/at_user/qq_user；params.limit 可选。"
     "- action=travel_plan：旅行规划；target=trip；params.destination/days/nights 可填则填。"
     "- action=web_summary：网页总结；target=url；params.url 为链接（没有就留空），支持 github.com、v2ex.com、linux.do、news.ycombinator.com、bilibili.com、zhihu.com、x.com、twitter.com，params.focus 可选。"
     "- action=bangumi_download：从蜜柑下载番剧；target=mikan；params.keyword 为番剧名。params.episode 可选，不填时可用 latest=true 下载最新一集。params.subtitle_group 可选。"
     "- action=forward_view：查看转发聊天记录；target=message_forward 或 reply_forward；params.limit 可选。"
     "- action=recall_view：查看最近撤回消息；target=recent_recall；params.count 可选。"
+    "- 若用户要求“记住/别忘了/记下来”某人信息，优先 action=memory_record。"
+    "- 若用户询问“你记得我什么/查记忆/查看记忆”，优先 action=memory_view。"
     "- 若当前消息包含转发且用户要求“查看/展开/总结转发”，优先 action=forward_view。"
     "- 若用户提到“撤回了什么/看撤回消息”，优先 action=recall_view。"
     "- 如果消息是蜜柑链接、.torrent 链接或“种子文件下载”，优先输出 action=bangumi_download，并在 params.uri 填链接（有就填）。"
@@ -313,6 +321,9 @@ class UnsupportedImageError(RuntimeError):
 _SELF_ID_PATTERNS = [
     re.compile(r"^(作为|我作为)(一名|一个)?(LLM|大语言模型|语言模型|AI|模型).*?[，,。]\s*", re.I),
 ]
+_MEMORY_COMMAND_PREFIX_RE = re.compile(
+    r"^(?:请|帮我|麻烦)?(?:把)?(?:这个)?(?:记住|记一下|记下|加入记忆|添加记忆|更新记忆)\s*"
+)
 
 
 def _strip_markdown(text: str) -> str:
@@ -1242,6 +1253,14 @@ class RecalledMessageSnapshot:
 
 
 @dataclass
+class MemberMemory:
+    ts: float
+    text: str
+    source_user_id: Optional[str] = None
+    source_user_name: Optional[str] = None
+
+
+@dataclass
 class BangumiRelease:
     title: str
     page_url: str
@@ -1273,6 +1292,7 @@ class SessionState:
     handled_texts: dict[str, float]
     recalled_messages: List[RecalledMessage]
     recalled_message_snapshots: dict[int, RecalledMessageSnapshot]
+    member_memories: dict[str, List[MemberMemory]]
     history_lock: asyncio.Lock
     bangumi_episode_group_map: dict[str, dict[int, str]]
 
@@ -1286,7 +1306,7 @@ _SESSIONS_LOADED = False
 _SESSION_PERSIST_DIRTY = False
 _SESSION_PERSIST_TASK: Optional[asyncio.Task[None]] = None
 _SESSION_PERSIST_LOCK: Optional[asyncio.Lock] = None
-_SESSION_PERSIST_VERSION = 1
+_SESSION_PERSIST_VERSION = 2
 
 
 def _bangumi_subs_lock() -> asyncio.Lock:
@@ -1349,7 +1369,9 @@ def _coerce_persist_float(value: object) -> Optional[float]:
     try:
         if isinstance(value, bool):
             return None
-        return float(value)
+        if isinstance(value, (int, float, str)):
+            return float(value)
+        return None
     except Exception:
         return None
 
@@ -1418,6 +1440,25 @@ def _deserialize_recalled_snapshot(payload: object) -> Optional[RecalledMessageS
     )
 
 
+def _deserialize_member_memory(payload: object) -> Optional[MemberMemory]:
+    if not isinstance(payload, dict):
+        return None
+    ts = _coerce_persist_float(payload.get("ts"))
+    if ts is None:
+        return None
+    text = _normalize_memory_text(payload.get("text"))
+    if not text:
+        return None
+    source_user_id = str(payload.get("source_user_id") or "").strip() or None
+    source_user_name = _normalize_user_name(payload.get("source_user_name")) or None
+    return MemberMemory(
+        ts=ts,
+        text=text,
+        source_user_id=source_user_id,
+        source_user_name=source_user_name,
+    )
+
+
 def _build_state_from_persist_payload(payload: object) -> Optional[SessionState]:
     if not isinstance(payload, dict):
         return None
@@ -1456,7 +1497,30 @@ def _build_state_from_persist_payload(payload: object) -> Optional[SessionState]
             if text:
                 image_descriptions[message_id] = text
 
-    if not history_items and not recalled_messages and not recalled_snapshots and not image_descriptions:
+    member_memories: dict[str, List[MemberMemory]] = {}
+    raw_member_memories = payload.get("member_memories")
+    if isinstance(raw_member_memories, dict):
+        for key, value in raw_member_memories.items():
+            user_id = str(key or "").strip()
+            if not user_id:
+                continue
+            if not isinstance(value, list):
+                continue
+            memories: List[MemberMemory] = []
+            for raw in value:
+                item = _deserialize_member_memory(raw)
+                if item is not None:
+                    memories.append(item)
+            if memories:
+                member_memories[user_id] = memories
+
+    if (
+        not history_items
+        and not recalled_messages
+        and not recalled_snapshots
+        and not image_descriptions
+        and not member_memories
+    ):
         return None
 
     state = SessionState(
@@ -1471,6 +1535,7 @@ def _build_state_from_persist_payload(payload: object) -> Optional[SessionState]
         handled_texts={},
         recalled_messages=recalled_messages,
         recalled_message_snapshots=recalled_snapshots,
+        member_memories=member_memories,
         history_lock=asyncio.Lock(),
         bangumi_episode_group_map={},
     )
@@ -1520,6 +1585,7 @@ async def _snapshot_state_for_persist(state: SessionState) -> Optional[dict[str,
             and not state.recalled_messages
             and not state.recalled_message_snapshots
             and not state.image_descriptions
+            and not state.member_memories
         ):
             return None
         history_payload: List[dict[str, object]] = []
@@ -1558,6 +1624,20 @@ async def _snapshot_state_for_persist(state: SessionState) -> Optional[dict[str,
                     "text": item.text,
                 }
             )
+        member_memories_payload: dict[str, List[dict[str, object]]] = {}
+        for user_id, memories in state.member_memories.items():
+            rows: List[dict[str, object]] = []
+            for item in memories:
+                rows.append(
+                    {
+                        "ts": item.ts,
+                        "text": item.text,
+                        "source_user_id": item.source_user_id,
+                        "source_user_name": item.source_user_name,
+                    }
+                )
+            if rows:
+                member_memories_payload[str(user_id)] = rows
         return {
             "history": history_payload,
             "recalled_messages": recalled_payload,
@@ -1565,6 +1645,7 @@ async def _snapshot_state_for_persist(state: SessionState) -> Optional[dict[str,
             "image_descriptions": {
                 str(msg_id): text for msg_id, text in state.image_descriptions.items() if text
             },
+            "member_memories": member_memories_payload,
         }
 
 
@@ -1638,6 +1719,7 @@ def _get_state(session_id: str) -> SessionState:
             handled_texts={},
             recalled_messages=[],
             recalled_message_snapshots={},
+            member_memories={},
             history_lock=asyncio.Lock(),
             bangumi_episode_group_map={},
         )
@@ -2209,6 +2291,70 @@ def _wrap_prompt_with_reference(
     return f"参考对话(仅供参考，不需要回复):\n{reference_text}\n\n{current_label}:\n{prompt}"
 
 
+def _memory_item_max_chars() -> int:
+    try:
+        value = int(getattr(config, "memory_item_max_chars", 0))
+    except Exception:
+        value = 0
+    if value <= 0:
+        return _MEMORY_ITEM_MAX_CHARS
+    return max(20, min(400, value))
+
+
+def _memory_max_items_per_user() -> int:
+    try:
+        value = int(getattr(config, "memory_max_items_per_user", 0))
+    except Exception:
+        value = 0
+    if value <= 0:
+        return _MEMORY_MAX_ITEMS_PER_USER
+    return max(1, min(200, value))
+
+
+def _memory_max_users_per_session() -> int:
+    try:
+        value = int(getattr(config, "memory_max_users_per_session", 0))
+    except Exception:
+        value = 0
+    if value <= 0:
+        return _MEMORY_MAX_USERS_PER_SESSION
+    return max(1, min(2000, value))
+
+
+def _normalize_memory_text(value: object) -> str:
+    if value is None:
+        return ""
+    text = _ensure_plain_text(str(value))
+    text = _collapse_spaces(text)
+    text = text.strip(" \t\r\n,，。.!！?？;；:：")
+    if not text:
+        return ""
+    return _truncate(text, _memory_item_max_chars())
+
+
+def _memory_dedupe_key(text: str) -> str:
+    normalized = _normalize_memory_text(text)
+    if not normalized:
+        return ""
+    return re.sub(r"\s+", "", normalized).lower()
+
+
+def _memory_preview_text(state: SessionState, user_id: str, *, limit: int = 5) -> str:
+    qq = str(user_id or "").strip()
+    if not qq:
+        return ""
+    items = state.member_memories.get(qq) or []
+    if not items:
+        return ""
+    selected = items[-max(1, min(limit, _MEMORY_QUERY_MAX_ITEMS)) :]
+    lines: List[str] = []
+    for item in selected:
+        text = _normalize_memory_text(item.text)
+        if text:
+            lines.append(f"- {text}")
+    return "\n".join(lines)
+
+
 def _image_cache_max_images() -> int:
     try:
         value = int(getattr(config, "image_cache_max_images", 0))
@@ -2295,6 +2441,60 @@ def _prune_state(state: SessionState, *, trim_history: bool = True) -> None:
                 for msg_id, item in state.recalled_message_snapshots.items()
                 if msg_id in keep_ids
             }
+    if state.member_memories:
+        max_users = _memory_max_users_per_session()
+        max_items = _memory_max_items_per_user()
+        normalized_memory: dict[str, List[MemberMemory]] = {}
+        for raw_user_id, raw_items in state.member_memories.items():
+            user_id = str(raw_user_id or "").strip()
+            if not user_id:
+                continue
+            items: List[MemberMemory] = []
+            for item in raw_items:
+                text = _normalize_memory_text(item.text)
+                if not text:
+                    continue
+                items.append(
+                    MemberMemory(
+                        ts=float(item.ts) if item.ts else _now(),
+                        text=text,
+                        source_user_id=str(item.source_user_id or "").strip() or None,
+                        source_user_name=_normalize_user_name(item.source_user_name) or None,
+                    )
+                )
+            if not items:
+                continue
+            items.sort(key=lambda row: row.ts)
+            if len(items) > max_items:
+                items = items[-max_items:]
+            dedupe: dict[str, MemberMemory] = {}
+            for item in items:
+                key = _memory_dedupe_key(item.text)
+                if not key:
+                    continue
+                previous = dedupe.get(key)
+                if previous is None or previous.ts <= item.ts:
+                    dedupe[key] = item
+            if dedupe:
+                merged = sorted(dedupe.values(), key=lambda row: row.ts)
+                if len(merged) > max_items:
+                    merged = merged[-max_items:]
+                normalized_memory[user_id] = merged
+        if max_users > 0 and len(normalized_memory) > max_users:
+            keep_ids = {
+                user_id
+                for user_id, _ in sorted(
+                    normalized_memory.items(),
+                    key=lambda row: row[1][-1].ts if row[1] else 0.0,
+                    reverse=True,
+                )[:max_users]
+            }
+            normalized_memory = {
+                user_id: items
+                for user_id, items in normalized_memory.items()
+                if user_id in keep_ids
+            }
+        state.member_memories = normalized_memory
     valid_message_ids: set[int] = set()
     if state.image_cache:
         valid_message_ids.update(int(msg_id) for msg_id in state.image_cache.keys())
@@ -2696,6 +2896,215 @@ async def _build_user_info_reply(
             )
         )
     return "\n\n".join(messages).strip()
+
+
+def _extract_memory_from_raw_text(raw_text: str) -> str:
+    cleaned = _normalize_prompt_text(raw_text)
+    if not cleaned:
+        return ""
+    cleaned = _MEMORY_COMMAND_PREFIX_RE.sub("", cleaned).strip()
+    return _normalize_memory_text(cleaned)
+
+
+def _intent_memory_text(intent: dict) -> str:
+    params = _intent_params(intent)
+    return _normalize_memory_text(params.get("memory"))
+
+
+async def _remember_member_memory(
+    state: SessionState,
+    *,
+    target_user_id: str,
+    memory_text: str,
+    source_user_id: Optional[str] = None,
+    source_user_name: Optional[str] = None,
+    ts: Optional[float] = None,
+) -> bool:
+    user_id = str(target_user_id or "").strip()
+    text = _normalize_memory_text(memory_text)
+    if not user_id or not text:
+        return False
+    key = _memory_dedupe_key(text)
+    if not key:
+        return False
+    now_ts = _now() if ts is None else float(ts)
+    async with state.history_lock:
+        rows = list(state.member_memories.get(user_id) or [])
+        updated = False
+        for idx, item in enumerate(rows):
+            if _memory_dedupe_key(item.text) != key:
+                continue
+            rows[idx] = MemberMemory(
+                ts=now_ts,
+                text=text,
+                source_user_id=str(source_user_id or "").strip() or item.source_user_id,
+                source_user_name=_normalize_user_name(source_user_name) or item.source_user_name,
+            )
+            updated = True
+            break
+        if not updated:
+            rows.append(
+                MemberMemory(
+                    ts=now_ts,
+                    text=text,
+                    source_user_id=str(source_user_id or "").strip() or None,
+                    source_user_name=_normalize_user_name(source_user_name) or None,
+                )
+            )
+        rows.sort(key=lambda row: row.ts)
+        max_items = _memory_max_items_per_user()
+        if len(rows) > max_items:
+            rows = rows[-max_items:]
+        state.member_memories[user_id] = rows
+        _prune_state(state, trim_history=False)
+    _schedule_persist_sessions()
+    return True
+
+
+async def _list_member_memories(
+    state: SessionState,
+    *,
+    target_user_id: str,
+    limit: int,
+) -> List[MemberMemory]:
+    user_id = str(target_user_id or "").strip()
+    if not user_id:
+        return []
+    size = max(1, min(_MEMORY_QUERY_MAX_ITEMS, limit))
+    async with state.history_lock:
+        rows = list(state.member_memories.get(user_id) or [])
+    if not rows:
+        return []
+    rows.sort(key=lambda item: item.ts)
+    return rows[-size:]
+
+
+async def _resolve_memory_targets(
+    bot: Bot,
+    event: MessageEvent,
+    intent: dict,
+    *,
+    at_users: List[str],
+) -> Tuple[List[Tuple[str, str]], Optional[str]]:
+    target = str(intent.get("target") or "").lower()
+    params = _intent_params(intent)
+    qq_targets: List[str] = []
+    if target == "qq_user":
+        qq = str(params.get("qq") or "").strip()
+        if not qq or not qq.isdigit():
+            return [], "请提供有效的 QQ 号。"
+        qq_targets = [qq]
+    elif target == "at_user":
+        if at_users:
+            qq_targets = list(at_users)
+        else:
+            qq = str(params.get("qq") or "").strip()
+            if qq and qq.isdigit():
+                qq_targets = [qq]
+            else:
+                return [], "请先@成员，或提供 QQ 号。"
+    else:
+        qq_targets = [str(event.get_user_id())]
+    if not qq_targets:
+        return [], "没有找到要操作的群成员。"
+
+    result: List[Tuple[str, str]] = []
+    sender_qq = str(event.get_user_id())
+    sender_name = _event_user_name(event) or "用户"
+    for qq in qq_targets[:5]:
+        display_name = ""
+        if qq == sender_qq:
+            display_name = sender_name
+        elif isinstance(event, GroupMessageEvent):
+            display_name = await _resolve_at_display_name(bot, event, qq)
+        if not display_name:
+            display_name = f"QQ{qq}"
+        result.append((qq, display_name))
+    return result, None
+
+
+async def _build_memory_record_reply(
+    bot: Bot,
+    event: MessageEvent,
+    state: SessionState,
+    intent: dict,
+    *,
+    at_users: List[str],
+    raw_text: str,
+) -> str:
+    targets, err = await _resolve_memory_targets(
+        bot,
+        event,
+        intent,
+        at_users=at_users,
+    )
+    if err:
+        return err
+    memory_text = _intent_memory_text(intent)
+    if not memory_text:
+        memory_text = _extract_memory_from_raw_text(raw_text)
+    if not memory_text:
+        return "请告诉我具体要记住什么内容。"
+    source_user_id = str(event.get_user_id())
+    source_user_name = _event_user_name(event)
+    saved: List[str] = []
+    for qq, display_name in targets:
+        ok = await _remember_member_memory(
+            state,
+            target_user_id=qq,
+            memory_text=memory_text,
+            source_user_id=source_user_id,
+            source_user_name=source_user_name,
+            ts=_event_ts(event),
+        )
+        if ok:
+            saved.append(display_name)
+    if not saved:
+        return "没有保存成功，请换一种说法再试。"
+    if len(saved) == 1:
+        return f"已记住 {saved[0]}：{memory_text}"
+    return f"已记住 {len(saved)} 位成员：{memory_text}"
+
+
+async def _build_memory_view_reply(
+    bot: Bot,
+    event: MessageEvent,
+    state: SessionState,
+    intent: dict,
+    *,
+    at_users: List[str],
+) -> str:
+    params = _intent_params(intent)
+    limit = _coerce_int(params.get("limit"))
+    view_limit = max(1, min(_MEMORY_QUERY_MAX_ITEMS, limit if limit is not None else 5))
+    targets, err = await _resolve_memory_targets(
+        bot,
+        event,
+        intent,
+        at_users=at_users,
+    )
+    if err:
+        return err
+    lines: List[str] = []
+    for qq, display_name in targets:
+        rows = await _list_member_memories(
+            state,
+            target_user_id=qq,
+            limit=view_limit,
+        )
+        if not rows:
+            lines.append(f"{display_name}：暂时没有记忆。")
+            continue
+        lines.append(f"{display_name} 的记忆：")
+        for idx, item in enumerate(reversed(rows), start=1):
+            time_text = _format_event_time_text(item.ts)
+            if time_text:
+                lines.append(f"{idx}. {item.text}（{time_text}）")
+            else:
+                lines.append(f"{idx}. {item.text}")
+    if not lines:
+        return "暂时没有记忆。"
+    return "\n".join(lines).strip()
 
 
 WEATHER_CODE_MAP = {
@@ -6042,6 +6451,7 @@ notice_collector = on_notice(priority=99, block=False)
 nlp_handler = on_message(priority=15, block=False)
 avatar_handler = on_command("处理头像", priority=5)
 chat_handler = on_command("技能", aliases={"聊天", "对话"}, priority=5)
+memory_handler = on_command("记忆", aliases={"记住", "查记忆", "查看记忆"}, priority=5)
 weather_handler = on_command("天气", aliases={"查询天气", "查天气"}, priority=5)
 user_info_handler = on_command("用户信息", aliases={"查用户", "查用户信息"}, priority=5)
 travel_handler = on_command("旅行规划", aliases={"旅行计划", "行程规划", "旅行", "行程"}, priority=5)
@@ -6311,6 +6721,10 @@ def _is_command_message(text: str) -> bool:
         "用户信息",
         "查用户",
         "查用户信息",
+        "记忆",
+        "记住",
+        "查记忆",
+        "查看记忆",
         "旅行规划",
         "旅行计划",
         "行程规划",
@@ -6777,6 +7191,14 @@ def _build_chat_prompt(
         f"消息内容: {user_text}",
         "可用语法: [AT:QQ号], [REPLY:消息ID]",
     ]
+    sender_memory_text = _memory_preview_text(state, sender_user_id, limit=5)
+    if sender_memory_text:
+        parts.extend(
+            [
+                "你对发送者的长期记忆(仅供参考):",
+                sender_memory_text,
+            ]
+        )
     if msg_id is not None:
         parts.append(f"消息ID: {msg_id}")
     if send_time_text:
@@ -6793,6 +7215,18 @@ def _build_chat_prompt(
             parts.append(f"消息ID: {reply_message_id}")
         if reply_sender_id is not None:
             parts.append(f"发送者QQ: {reply_sender_id}")
+            reply_memory_text = _memory_preview_text(
+                state,
+                str(reply_sender_id),
+                limit=5,
+            )
+            if reply_memory_text and str(reply_sender_id) != sender_user_id:
+                parts.extend(
+                    [
+                        "你对被回复人的长期记忆(仅供参考):",
+                        reply_memory_text,
+                    ]
+                )
     if previous:
         parts.extend(
             [
@@ -6812,6 +7246,8 @@ _ALLOWED_ACTIONS = {
     "weather",
     "avatar_get",
     "user_info",
+    "memory_record",
+    "memory_view",
     "travel_plan",
     "web_summary",
     "bangumi_download",
@@ -6871,7 +7307,14 @@ def _normalize_intent(
         return {"action": "ignore", "target": "none", "params": {}}
 
     if action == "chat":
-        return {"action": "chat", "target": "none", "params": params}
+        normalized_params: dict[str, object] = {}
+        memory_text = _normalize_memory_text(params.get("memory"))
+        if memory_text:
+            normalized_params["memory"] = memory_text
+        raw_reply = params.get("reply")
+        if isinstance(raw_reply, str) and raw_reply.strip():
+            normalized_params["reply"] = raw_reply.strip()
+        return {"action": "chat", "target": "none", "params": normalized_params}
 
     if action == "history_clear":
         return {"action": "history_clear", "target": "none", "params": {}}
@@ -6962,6 +7405,66 @@ def _normalize_intent(
             qq = raw_qq.strip()
             if qq.isdigit():
                 normalized_params["qq"] = qq
+        raw_reply = params.get("reply")
+        if isinstance(raw_reply, str) and raw_reply.strip():
+            normalized_params["reply"] = raw_reply.strip()
+        return {
+            "action": action,
+            "target": target,
+            "params": normalized_params,
+        }
+
+    if action == "memory_record":
+        if target not in _ALLOWED_TARGETS:
+            target = ""
+        normalized_params: dict[str, object] = {}
+        raw_qq = params.get("qq")
+        qq_value = ""
+        if isinstance(raw_qq, str) and raw_qq.strip():
+            qq = raw_qq.strip()
+            if qq.isdigit():
+                qq_value = qq
+                normalized_params["qq"] = qq
+        if not target or target == "none":
+            if qq_value:
+                target = "qq_user"
+            elif at_users:
+                target = "at_user"
+            else:
+                target = "sender_user"
+        memory_text = _normalize_memory_text(params.get("memory"))
+        if memory_text:
+            normalized_params["memory"] = memory_text
+        raw_reply = params.get("reply")
+        if isinstance(raw_reply, str) and raw_reply.strip():
+            normalized_params["reply"] = raw_reply.strip()
+        return {
+            "action": action,
+            "target": target,
+            "params": normalized_params,
+        }
+
+    if action == "memory_view":
+        if target not in _ALLOWED_TARGETS:
+            target = ""
+        normalized_params: dict[str, object] = {}
+        raw_qq = params.get("qq")
+        qq_value = ""
+        if isinstance(raw_qq, str) and raw_qq.strip():
+            qq = raw_qq.strip()
+            if qq.isdigit():
+                qq_value = qq
+                normalized_params["qq"] = qq
+        if not target or target == "none":
+            if qq_value:
+                target = "qq_user"
+            elif at_users:
+                target = "at_user"
+            else:
+                target = "sender_user"
+        limit = _coerce_int(params.get("limit"))
+        if limit is not None and limit > 0:
+            normalized_params["limit"] = min(_MEMORY_QUERY_MAX_ITEMS, limit)
         raw_reply = params.get("reply")
         if isinstance(raw_reply, str) and raw_reply.strip():
             normalized_params["reply"] = raw_reply.strip()
@@ -7133,6 +7636,29 @@ async def _build_travel_plan_reply(
     return reply
 
 
+async def _remember_sender_memory_from_intent(
+    state: SessionState,
+    event: MessageEvent,
+    intent: dict,
+    *,
+    user_name: str,
+) -> None:
+    memory_text = _intent_memory_text(intent)
+    if not memory_text:
+        return
+    try:
+        await _remember_member_memory(
+            state,
+            target_user_id=str(event.get_user_id()),
+            memory_text=memory_text,
+            source_user_id=str(event.get_user_id()),
+            source_user_name=user_name,
+            ts=_event_ts(event),
+        )
+    except Exception as exc:
+        logger.debug("Remember sender memory failed: {}", _safe_error_message(exc))
+
+
 async def _dispatch_intent(
     bot: Bot,
     intent: dict,
@@ -7177,6 +7703,8 @@ async def _dispatch_intent(
     raw_message_text = ""
     if action in {
         "chat",
+        "memory_record",
+        "memory_view",
         "forward_view",
         "recall_view",
         "weather",
@@ -7215,11 +7743,66 @@ async def _dispatch_intent(
                 user_name=user_name,
                 to_bot=True,
             )
+            await _remember_sender_memory_from_intent(
+                state,
+                event,
+                intent,
+                user_name=user_name,
+            )
             await _append_history(state, "model", reply)
             await _send_text_response(bot, event, send_func, reply)
             _mark_handled_request(state, event, text)
         except Exception as exc:
             logger.error("NLP chat failed: {}", _safe_error_message(exc))
+        return
+
+    if action == "memory_record":
+        raw_text = _strip_leading_command(
+            raw_message_text,
+            ("记忆", "记住", "添加记忆", "更新记忆", "查记忆", "查看记忆"),
+        )
+        if not raw_text:
+            raw_text = raw_message_text.strip() or text.strip()
+        reply = await _build_memory_record_reply(
+            bot,
+            event,
+            state,
+            intent,
+            at_users=at_users,
+            raw_text=raw_text,
+        )
+        await _append_history(
+            state,
+            "user",
+            f"记忆记录：{raw_message_text or text}",
+            user_id=str(event.get_user_id()),
+            user_name=user_name,
+            to_bot=True,
+        )
+        await _append_history(state, "model", reply)
+        await _send_text_response(bot, event, send_func, reply)
+        _mark_handled_request(state, event, text)
+        return
+
+    if action == "memory_view":
+        reply = await _build_memory_view_reply(
+            bot,
+            event,
+            state,
+            intent,
+            at_users=at_users,
+        )
+        await _append_history(
+            state,
+            "user",
+            f"记忆查询：{raw_message_text or text}",
+            user_id=str(event.get_user_id()),
+            user_name=user_name,
+            to_bot=True,
+        )
+        await _append_history(state, "model", reply)
+        await _send_text_response(bot, event, send_func, reply)
+        _mark_handled_request(state, event, text)
         return
 
     if action == "forward_view":
@@ -7658,8 +8241,8 @@ async def _dispatch_intent(
 
 def _clarify_intent_text(has_image: bool) -> str:
     if has_image:
-        return "我没太听懂，你是想聊这张图、处理图片、查天气、查用户信息、旅行规划、网页总结、番剧下载、查看转发还是查看撤回？"
-    return "我没太听懂，你是想聊天、处理图片、无图生成、查天气、查用户信息、旅行规划、网页总结、番剧下载、查看转发、查看撤回还是清除历史？"
+        return "我没太听懂，你是想聊这张图、处理图片、记住信息、查记忆、查天气、查用户信息、旅行规划、网页总结、番剧下载、查看转发还是查看撤回？"
+    return "我没太听懂，你是想聊天、记住信息、查记忆、处理图片、无图生成、查天气、查用户信息、旅行规划、网页总结、番剧下载、查看转发、查看撤回还是清除历史？"
 
 
 _TRAVEL_KEYWORDS = ("旅行", "旅游", "行程", "出行", "游玩")
@@ -8050,6 +8633,29 @@ async def handle_chat(bot: Bot, event: MessageEvent, args: Message = CommandArg(
         event,
         text=f"聊天 {prompt}",
         send_func=chat_handler.send,
+    )
+
+
+@memory_handler.handle()
+async def handle_memory(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+    query = args.extract_plain_text().strip()
+    plain = event.get_plaintext().strip()
+    plain_no_prefix = plain
+    for prefix in _command_starts():
+        if prefix and plain_no_prefix.startswith(prefix):
+            plain_no_prefix = plain_no_prefix[len(prefix) :].lstrip()
+            break
+    if plain_no_prefix.startswith("查记忆") or plain_no_prefix.startswith("查看记忆"):
+        text = f"查记忆 {query}".strip()
+    elif plain_no_prefix.startswith("记住"):
+        text = f"记住 {query}".strip()
+    else:
+        text = f"记忆 {query}".strip() if query else "查记忆 我"
+    await _handle_command_via_intent(
+        bot,
+        event,
+        text=text,
+        send_func=memory_handler.send,
     )
 
 

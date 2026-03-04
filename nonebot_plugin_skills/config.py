@@ -20,6 +20,9 @@ class Config(BaseModel):
     history_persist_enable: bool = True
     history_persist_file: str = "data/nonebot_plugin_skills/session_state.json"
     image_cache_max_images: int = 10
+    memory_max_users_per_session: int = 500
+    memory_max_items_per_user: int = 30
+    memory_item_max_chars: int = 120
     history_reference_only: bool = True
     chat_style_strength: float = 0.35
     chat_knowledge_temperature: float = 0.2
