@@ -68,6 +68,9 @@ ARIA2_TIMEOUT=20.0                     # aria2 RPC 调用超时（秒）
 # 会话历史
 HISTORY_TTL_SEC=600                  # 会话状态保留时长
 HISTORY_MAX_MESSAGES=60              # 最大历史条数
+RECALL_TTL_SEC=86400                 # 撤回消息缓存保留时长（秒，默认24小时）
+RECALL_MAX_ITEMS=1000                # 每个会话最多保留多少条撤回记录
+RECALL_SNAPSHOT_MAX_ITEMS=5000       # 每个会话最多保留多少条撤回快照（用于命中被撤回原文）
 HISTORY_PERSIST_ENABLE=true          # 进程重启后恢复历史（默认开启）
 HISTORY_PERSIST_FILE=data/nonebot_plugin_skills/session_state.json  # 历史/记忆持久化文件
 IMAGE_CACHE_MAX_IMAGES=10            # 图片缓存：最多缓存最近 N 张图片（用于防止图片链接过期）

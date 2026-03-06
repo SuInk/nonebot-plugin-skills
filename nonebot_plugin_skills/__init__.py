@@ -84,8 +84,9 @@ _FORWARD_FETCH_NODE_LIMIT = 30
 _FORWARD_FETCH_CHAR_LIMIT = 2200
 _FORWARD_PROMPT_NODE_LIMIT = 12
 _FORWARD_PROMPT_CHAR_LIMIT = 1000
-_RECALL_MAX_ITEMS = 100
-_RECALL_SNAPSHOT_MAX_ITEMS = 300
+_DEFAULT_RECALL_TTL_SEC = 24 * 60 * 60
+_DEFAULT_RECALL_MAX_ITEMS = 1000
+_DEFAULT_RECALL_SNAPSHOT_MAX_ITEMS = 5000
 _IMAGE_DESCRIBE_MAX_CHARS = 120
 _IMAGE_DESCRIBE_WAIT_SEC = 2.5
 _MEMORY_MAX_USERS_PER_SESSION = 500
@@ -2365,9 +2366,40 @@ def _image_cache_max_images() -> int:
     return max(1, value)
 
 
+def _recall_ttl_sec() -> int:
+    try:
+        value = int(getattr(config, "recall_ttl_sec", 0))
+    except Exception:
+        value = 0
+    if value <= 0:
+        return _DEFAULT_RECALL_TTL_SEC
+    return max(60, value)
+
+
+def _recall_max_items() -> int:
+    try:
+        value = int(getattr(config, "recall_max_items", 0))
+    except Exception:
+        value = 0
+    if value <= 0:
+        return _DEFAULT_RECALL_MAX_ITEMS
+    return max(20, value)
+
+
+def _recall_snapshot_max_items() -> int:
+    try:
+        value = int(getattr(config, "recall_snapshot_max_items", 0))
+    except Exception:
+        value = 0
+    if value <= 0:
+        return _DEFAULT_RECALL_SNAPSHOT_MAX_ITEMS
+    return max(100, value)
+
+
 def _prune_state(state: SessionState, *, trim_history: bool = True) -> None:
     ttl = max(30, int(config.history_ttl_sec))
     cutoff = _now() - ttl
+    recall_cutoff = _now() - _recall_ttl_sec()
     state.history = [item for item in state.history if item.ts >= cutoff]
     if trim_history:
         max_messages = max(1, int(config.history_max_messages))
@@ -2417,24 +2449,26 @@ def _prune_state(state: SessionState, *, trim_history: bool = True) -> None:
         }
     if state.recalled_messages:
         state.recalled_messages = [
-            item for item in state.recalled_messages if item.ts >= cutoff
+            item for item in state.recalled_messages if item.ts >= recall_cutoff
         ]
-        if len(state.recalled_messages) > _RECALL_MAX_ITEMS:
-            state.recalled_messages = state.recalled_messages[-_RECALL_MAX_ITEMS:]
+        recall_limit = _recall_max_items()
+        if len(state.recalled_messages) > recall_limit:
+            state.recalled_messages = state.recalled_messages[-recall_limit:]
     if state.recalled_message_snapshots:
         state.recalled_message_snapshots = {
             msg_id: item
             for msg_id, item in state.recalled_message_snapshots.items()
-            if item.ts >= cutoff
+            if item.ts >= recall_cutoff
         }
-        if len(state.recalled_message_snapshots) > _RECALL_SNAPSHOT_MAX_ITEMS:
+        snapshot_limit = _recall_snapshot_max_items()
+        if len(state.recalled_message_snapshots) > snapshot_limit:
             keep_ids = {
                 msg_id
                 for msg_id, _ in sorted(
                     state.recalled_message_snapshots.items(),
                     key=lambda kv: kv[1].ts,
                     reverse=True,
-                )[:_RECALL_SNAPSHOT_MAX_ITEMS]
+                )[:snapshot_limit]
             }
             state.recalled_message_snapshots = {
                 msg_id: item
@@ -6567,14 +6601,15 @@ async def _upsert_recalled_message_snapshot(
 ) -> None:
     async with state.history_lock:
         state.recalled_message_snapshots[item.message_id] = item
-        if len(state.recalled_message_snapshots) > _RECALL_SNAPSHOT_MAX_ITEMS:
+        snapshot_limit = _recall_snapshot_max_items()
+        if len(state.recalled_message_snapshots) > snapshot_limit:
             keep_ids = {
                 msg_id
                 for msg_id, _ in sorted(
                     state.recalled_message_snapshots.items(),
                     key=lambda kv: kv[1].ts,
                     reverse=True,
-                )[:_RECALL_SNAPSHOT_MAX_ITEMS]
+                )[:snapshot_limit]
             }
             state.recalled_message_snapshots = {
                 msg_id: snapshot
@@ -6604,8 +6639,9 @@ def _notice_session_id(event: object) -> Optional[str]:
 async def _append_recalled_message(state: SessionState, item: RecalledMessage) -> None:
     async with state.history_lock:
         state.recalled_messages.append(item)
-        if len(state.recalled_messages) > _RECALL_MAX_ITEMS:
-            state.recalled_messages = state.recalled_messages[-_RECALL_MAX_ITEMS:]
+        recall_limit = _recall_max_items()
+        if len(state.recalled_messages) > recall_limit:
+            state.recalled_messages = state.recalled_messages[-recall_limit:]
         _prune_state(state, trim_history=False)
     _schedule_persist_sessions()
 
@@ -6615,7 +6651,8 @@ async def _build_recalled_messages_text(bot: Bot, state: SessionState, *, count:
         return "最近没有记录到撤回消息。"
     size = max(1, min(20, count))
     rows = state.recalled_messages[-size:]
-    lines = [f"最近撤回消息（最多{size}条）："]
+    ttl_hours = max(1, _recall_ttl_sec() // 3600)
+    lines = [f"最近{ttl_hours}小时撤回消息（最多{size}条）："]
     display_rows = list(reversed(rows))
     need_desc_ids: List[int] = []
     for item in display_rows:

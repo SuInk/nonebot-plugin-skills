@@ -17,6 +17,9 @@ class Config(BaseModel):
     web_extract_max_chars: int = 12000
     history_ttl_sec: int = 600
     history_max_messages: int = 60
+    recall_ttl_sec: int = 86400
+    recall_max_items: int = 1000
+    recall_snapshot_max_items: int = 5000
     history_persist_enable: bool = True
     history_persist_file: str = "data/nonebot_plugin_skills/session_state.json"
     image_cache_max_images: int = 10
