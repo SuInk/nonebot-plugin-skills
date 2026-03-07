@@ -37,6 +37,7 @@ if V2_SKILLS_DIR.exists():
 # --- 核心消息处理器 ---
 nlp_handler = on_message(priority=50, block=False)
 _MESSAGE_CACHE = {} 
+_MESSAGE_ID_REPLY_RE = re.compile(r"\[ID:\s*(\d+)\]")
 
 def _should_trigger(event: MessageEvent) -> bool:
     if not isinstance(event, GroupMessageEvent):
@@ -72,11 +73,18 @@ async def _send_reply(bot: Bot, event: MessageEvent, reply: Union[str, Message])
     
     for i, p_text in enumerate(parts_texts):
         try:
+            reply_seg = None
+            reply_match = _MESSAGE_ID_REPLY_RE.search(p_text)
+            if reply_match:
+                reply_seg = MessageSegment.reply(int(reply_match.group(1)))
+                p_text = _MESSAGE_ID_REPLY_RE.sub("", p_text, count=1).strip()
+
             # 这里的核心逻辑：将字符串还原为 Message 对象，以保留二进制图片段
             # 我们根据 p_text 在原始 full_msg 中寻找对应的 segments
             # 简单实现：将 p_text 中的 CQ 码和文字拆开连续发送
             sub_segments = re.split(r"(\[CQ:image,[^\]]+\])", p_text)
             
+            pending_prefix = Message(reply_seg) if reply_seg else Message()
             for seg_text in sub_segments:
                 seg_text = seg_text.strip()
                 if not seg_text: continue
@@ -87,9 +95,15 @@ async def _send_reply(bot: Bot, event: MessageEvent, reply: Union[str, Message])
                     file_match = re.search(r"file=([^,\]]+)", seg_text)
                     if file_match:
                         file_val = file_match.group(1)
-                        await nlp_handler.send(MessageSegment.image(file_val))
+                        image_msg = pending_prefix + Message(MessageSegment.image(file_val))
+                        await nlp_handler.send(image_msg)
+                        pending_prefix = Message()
                 else:
-                    await nlp_handler.send(Message(seg_text))
+                    await nlp_handler.send(pending_prefix + Message(seg_text))
+                    pending_prefix = Message()
+
+            if pending_prefix:
+                await nlp_handler.send(pending_prefix)
                 
                 if len(sub_segments) > 1:
                     await asyncio.sleep(0.3)

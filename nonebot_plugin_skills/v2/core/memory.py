@@ -116,7 +116,7 @@ class MemoryCore:
         # 增加对历史记录中 ID 的提示
         history = self.get_history(session_id)
         if any(m.message_id for m in history):
-            prompt += "\n(你可以通过历史记录中的 [ID: xxx] 来识别用户正在回复哪条消息。)"
+            prompt += "\n(你可以通过历史记录中的 [ID: xxx] 来识别消息；如果要引用某条消息，直接输出对应的 [ID: xxx] 即可。)"
             
         return prompt
 
