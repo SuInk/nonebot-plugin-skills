@@ -40,6 +40,8 @@ class MemoryCore:
                     self.profiles[uid] = UserProfile(**prof_data)
                 for sid, history_data in data.get("sessions", {}).items():
                     self.sessions[sid] = [ChatMessage(**m) for m in history_data]
+                for sid, recall_data in data.get("recalls", {}).items():
+                    self.recalls[sid] = [RecalledMessage(**m) for m in recall_data]
                 logger.info(f"Memory loaded with IDs from {self.db_path}")
             except Exception as e:
                 logger.error(f"Error loading memory: {e}")
@@ -50,6 +52,7 @@ class MemoryCore:
             data = {
                 "profiles": {uid: p.dict() for uid, p in self.profiles.items()},
                 "sessions": {sid: [m.dict() for m in history] for sid, history in self.sessions.items()},
+                "recalls": {sid: [m.dict() for m in recalls] for sid, recalls in self.recalls.items()},
             }
             self.db_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
         except Exception as e:
@@ -101,6 +104,7 @@ class MemoryCore:
         self.recalls[session_id].append(recall)
         if len(self.recalls[session_id]) > max_recalls:
             self.recalls[session_id] = self.recalls[session_id][-max_recalls:]
+        asyncio.create_task(self._async_save())
 
     def get_recalls(self, session_id: str) -> List[RecalledMessage]:
         return self.recalls.get(session_id, [])
