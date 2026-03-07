@@ -5,6 +5,7 @@
 ## 功能
 - 处理头像/图片：命令内带图、@某人头像、或使用最近聊天图片
 - 聊天对话：带上下文的自然语言聊天
+- Skills 扩展：默认聊天模式，命中 skill 时按 `action/target/params` 调用对应技能
 - 群成员记忆：按会话记录每位成员的长期记忆（写入持久化文件），支持“记住”和“查记忆”
 - 单次调用聊天：一次生成事实答案与嘉然风格回复，事实冲突时自动回退到事实版
 - 天气查询：输入城市/地区即可查询当前天气
@@ -94,6 +95,9 @@ MESSAGE_SEND_DELAY_SEC=0.6           # 分段发送（按空行分段）时段�
 # NLP 触发
 NLP_ENABLE=true
 BOT_KEYWORDS=["Diana","diana","嘉然","然然"]  # 群聊中：命中关键词才触发（@/回复机器人也会触发）
+SKILLS_ENABLE=true
+SKILLS_DIR=data/nonebot_plugin_skills/skills
+SKILLS_DETAIL_MAX_CHARS=4000
 
 # 蜜柑/aria2 番剧下载
 MIKAN_BASE_URL=https://mikanani.me
@@ -134,13 +138,15 @@ GEMINI_LOG_RESPONSE=false
 | --- | --- |
 | 处理头像 <指令> | 处理头像/最近图片/@用户头像 |
 | 聊天 <内容> | 上下文聊天 |
-| 技能 <内容> | 上下文聊天 |
+| 技能 <内容> | 默认聊天，命中内置或自定义 skill 时自动调用 |
 | 记忆 <内容> | 记录/查询群成员记忆（也可用“记住/查记忆/查看记忆”） |
 | 天气 <城市> | 查询当前天气 |
 | 网页总结 <网页链接> | 总结主流网站网页正文 |
 | 番剧下载 <关键词/条件> | 检索蜜柑并提交到 aria2 |
 | 查看转发 [条数] | 展开当前消息/回复中的合并转发记录 |
 | 查看撤回 [条数] | 查看最近撤回消息记录 |
+| 评价撤回 [条数] | 对最近撤回消息做简短评价 |
+| 重载技能 | 重新加载 skills 目录下的技能文件 |
 
 ### 示例
 - `Diana帮忙把@向晚头像变成黑白`
@@ -158,11 +164,39 @@ GEMINI_LOG_RESPONSE=false
 - `番剧下载 葬送的芙莉莲 第31集 北宇治字幕组`
 - `查看转发 15`
 - `查看撤回 10`
+- `评价撤回 8`
 - `https://mikanani.me/Home/Episode/xxxx`
 - `https://mikanani.me/Download/20250101/xxxx.torrent`
 - `（直接发送 .torrent 文件）`
 - `订阅下载 葬送的芙莉莲`
 - `订阅下载 查看订阅`
 - `订阅下载 检查订阅`
+- `技能 把这些工作点整理成周报：修复支付bug、上线登录风控、补了3个回归测试`
 
 > 若图片模型仅返回文本结果，插件会直接把文本回复出来（便于你确认模型是否支持图像输出）。
+
+## Skills
+
+- 内置技能目录：`nonebot_plugin_skills/builtin_skills/<skill_name>/SKILL.md`
+- 自定义技能目录：`data/nonebot_plugin_skills/skills/<skill_name>/SKILL.md`
+- 运行时会先加载内置 skills，再加载自定义 skills；同名自定义 skill 会覆盖内置 skill。
+
+## 自定义 Skills
+
+- 默认目录：`data/nonebot_plugin_skills/skills`
+- 每个 skill 使用一个 `SKILL.md` 文件，必须由 NLP 先产出 `action/target/params`，命中后再执行技能。
+
+最小示例：
+
+```md
+---
+name: weekly_report
+description: 将零散工作内容整理为周报
+---
+
+输出要求：
+- 只输出纯文本
+- 结构固定为：本周完成、风险与阻塞、下周计划、需要协助
+```
+
+- 修改 skill 文件后可发送 `重载技能` 立即生效。

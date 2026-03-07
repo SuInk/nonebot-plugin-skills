@@ -1,10 +1,13 @@
 [tool.poetry]
 name = "nonebot-plugin-skills"
-version = "0.2.18"
+version = "1.0.0"
 description = "Gemini avatar/image and chat plugin with skills and context cache for NoneBot2"
 readme = "README.md"
 authors = ["SuInk <leisurenot@outlook.com>"]
 packages = [{ include = "nonebot_plugin_skills" }]
+include = [
+    { path = "nonebot_plugin_skills/builtin_skills/**/SKILL.md", format = ["sdist", "wheel"] }
+]
 
 [tool.poetry.dependencies]
 python = ">=3.9"
