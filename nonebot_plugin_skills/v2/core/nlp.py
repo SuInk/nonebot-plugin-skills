@@ -163,7 +163,12 @@ async def handle_user_message(bot: Any, event: Any, session_id: str, user_id: st
 
             skill_ctx = SkillContext(bot=bot, event=event, session_id=session_id, user_id=user_id, raw_text=text)
             for call in response.function_calls:
-                skill_result = await skill_manager.execute(call.name, context=skill_ctx, **call.args)
+                skill_name = str(call.name or "").strip()
+                raw_skill_args = call.args or {}
+                skill_args: Dict[str, Any] = (
+                    raw_skill_args if isinstance(raw_skill_args, dict) else dict(raw_skill_args)
+                )
+                skill_result = await skill_manager.execute(skill_name, context=skill_ctx, **skill_args)
                 if isinstance(skill_result, (bytes, MessageSegment)) or "[CQ:image" in str(skill_result):
                     img_seg = await build_image_segment(skill_result)
                     if img_seg:
@@ -172,8 +177,8 @@ async def handle_user_message(bot: Any, event: Any, session_id: str, user_id: st
                     clean_res = "[系统：图已发出]"
                 else: clean_res = str(skill_result)
                 
-                contents.append(types.Content(role="model", parts=[types.Part.from_function_call(name=call.name, args=call.args)]))
-                contents.append(types.Content(role="user", parts=[types.Part.from_function_response(name=call.name, response={"result": clean_res})]))
+                contents.append(types.Content(role="model", parts=[types.Part.from_function_call(name=skill_name, args=skill_args)]))
+                contents.append(types.Content(role="user", parts=[types.Part.from_function_response(name=skill_name, response={"result": clean_res})]))
             response = await client.aio.models.generate_content(model=active_model, contents=contents, config=config_obj)
 
         final_msg = await _extract_response_to_message(response)
