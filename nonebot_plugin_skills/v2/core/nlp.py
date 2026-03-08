@@ -251,10 +251,7 @@ async def handle_user_message(bot: Any, event: Any, session_id: str, user_id: st
         contents.append(types.Content(role="user", parts=[types.Part.from_text(text=str(input_text))] + current_image_parts))
 
     tools = skill_manager.get_llm_tools()
-    count_config = types.CountTokensConfig(
-        system_instruction=system_instruction,
-        tools=tools,
-    )
+    count_config = types.CountTokensConfig()
     config_obj = types.GenerateContentConfig(system_instruction=system_instruction, tools=tools, temperature=config.chat_style_temperature)
 
     # --- 3. 主动 Token 检查与预防性压缩 ---
@@ -271,7 +268,7 @@ async def handle_user_message(bot: Any, event: Any, session_id: str, user_id: st
         # 您可以根据需求调整这个值，或者从 config 中读取
         PREACTIVE_COMPRESSION_THRESHOLD = 30000
         
-        if current_tokens > PREACTIVE_COMPRESSION_THRESHOLD:
+        if current_tokens is not None and current_tokens > PREACTIVE_COMPRESSION_THRESHOLD:
             logger.info(f"Session {session_id} tokens ({current_tokens}) exceed threshold. Proactively compressing...")
             new_summary = await _summarize_history(session_id, history)
             if new_summary:
@@ -291,7 +288,19 @@ async def handle_user_message(bot: Any, event: Any, session_id: str, user_id: st
                 await _send_reply(bot, event, interim_msg)
                 full_reply.extend(interim_msg)
 
+            candidate_content = None
+            if response.candidates and response.candidates[0].content:
+                raw_content = response.candidates[0].content
+                if raw_content.parts:
+                    candidate_content = types.Content(
+                        role=raw_content.role or "model",
+                        parts=[types.Part(part) for part in raw_content.parts],
+                    )
+            if candidate_content:
+                contents.append(candidate_content)
+
             skill_ctx = SkillContext(bot=bot, event=event, session_id=session_id, user_id=user_id, raw_text=text)
+            response_parts = []
             for call in response.function_calls:
                 skill_name = str(call.name or "").strip()
                 raw_skill_args = call.args or {}
@@ -306,9 +315,18 @@ async def handle_user_message(bot: Any, event: Any, session_id: str, user_id: st
                         full_reply.append(img_seg)
                     clean_res = await _describe_image_result(skill_result)
                 else: clean_res = str(skill_result)
-                
-                contents.append(types.Content(role="model", parts=[types.Part.from_function_call(name=skill_name, args=skill_args)]))
-                contents.append(types.Content(role="user", parts=[types.Part.from_function_response(name=skill_name, response={"result": clean_res})]))
+
+                response_parts.append(
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            id=call.id,
+                            name=skill_name,
+                            response={"result": clean_res},
+                        )
+                    )
+                )
+            if response_parts:
+                contents.append(types.Content(role="user", parts=response_parts))
             response = await client.aio.models.generate_content(model=active_model, contents=contents, config=config_obj)
 
         final_msg = await _extract_response_to_message(response)

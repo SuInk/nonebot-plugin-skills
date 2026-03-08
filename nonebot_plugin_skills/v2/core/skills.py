@@ -5,6 +5,7 @@ import sys
 from typing import Callable, Dict, Any, List, Optional
 from pydantic import BaseModel
 from pathlib import Path
+from google.genai import types
 
 class SkillDef:
     def __init__(self, name: str, description: str, func: Callable, params_schema: dict):
@@ -39,9 +40,9 @@ class SkillManager:
             full_module_name = f"{package_name}.{module_name}"
             importlib.import_module(full_module_name)
 
-    def get_llm_tools(self) -> List[dict]:
+    def get_llm_tools(self) -> List[types.ToolDict]:
         """Generate Google Gemini function calling tool schema."""
-        tools = []
+        tools: List[types.ToolDict] = []
         for name, skill in self.skills.items():
             tool = {
                 "function_declarations": [

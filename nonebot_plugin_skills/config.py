@@ -9,7 +9,7 @@ class Config(BaseModel):
     google_api_key: str = ""
     
     # 基础对话模型 (使用 2.0 Flash 保证极速对话)
-    gemini_text_model: str = "gemini-3-flash-preview"
+    gemini_text_model: str = "gemini-2.5-flash"
     
     # 统一视觉/生图模型 (集生成与修改于一体)
     gemini_image_model: str = "gemini-3-flash-preview"
@@ -21,7 +21,7 @@ class Config(BaseModel):
     chat_style_temperature: float = 0.7
     
     # 消息分段阈值 (多少字以上尝试合并为转发消息)
-    combine_message_threshold: int = 80
+    combine_message_threshold: int = 120
     # 是否记录大模型原始响应日志
     gemini_log_response: bool = False
     
