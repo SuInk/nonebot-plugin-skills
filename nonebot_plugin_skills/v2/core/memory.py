@@ -150,10 +150,10 @@ class MemoryCore:
             for i, recall in enumerate(recalls[-5:], 1):
                 prompt += f"{i}. {recall.nickname}({recall.user_id}): {recall.text[:200]}\n"
         
-        # 增加对历史记录中 ID 的提示
+        # 增加对历史记录中消息 ID 的提示
         history = self.get_history(session_id)
         if any(m.message_id for m in history):
-            prompt += "\n(你可以通过历史记录中的 [ID: xxx] 来识别消息；如果要引用某条消息，请把对应的 [ID: xxx] 放在回复最开头，系统会自动处理。)"
+            prompt += "\n(你可以通过历史记录中的 [消息ID: xxx] 来识别消息；如果要引用某条消息，请把对应的消息ID写成 [CQ:reply,id=xxx] 并放在回复最开头。)"
             
         return prompt
 

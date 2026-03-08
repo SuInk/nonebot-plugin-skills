@@ -37,7 +37,8 @@ if V2_SKILLS_DIR.exists():
 # --- 核心消息处理器 ---
 nlp_handler = on_message(priority=50, block=False)
 _MESSAGE_CACHE = {} 
-_MESSAGE_ID_REPLY_RE = re.compile(r"\[ID:\s*(\d+)\]")
+_CQ_AT_RE = re.compile(r"\[CQ:at,[^\]]+\]")
+_CQ_REPLY_RE = re.compile(r"\[CQ:reply,id=(\d+)\]")
 
 def _normalize_msg_id(msg_id: Any) -> str:
     try:
@@ -156,7 +157,8 @@ def _should_use_forward_reply(event: MessageEvent, full_msg: Message) -> bool:
         return False
 
     msg_str = str(full_msg).strip()
-    msg_str = _MESSAGE_ID_REPLY_RE.sub("", msg_str, count=1).strip()
+    if _CQ_REPLY_RE.search(msg_str):
+        return False
     visible_length = max(len(Message(msg_str).extract_plain_text().strip()), len(msg_str))
     return visible_length >= config.combine_message_threshold
 
@@ -269,6 +271,8 @@ async def _send_forward_reply(bot: Bot, event: GroupMessageEvent, full_msg: Mess
 async def _send_reply(bot: Bot, event: MessageEvent, reply: Union[str, Message], force_forward: bool = False):
     if not reply: return
     full_msg = Message(reply) if isinstance(reply, str) else reply
+    if isinstance(event, PrivateMessageEvent):
+        full_msg = Message(_CQ_AT_RE.sub("", str(full_msg)).strip())
     if force_forward and isinstance(event, GroupMessageEvent):
         sent = await _send_forward_reply(bot, event, full_msg)
         if sent:
@@ -284,12 +288,6 @@ async def _send_reply(bot: Bot, event: MessageEvent, reply: Union[str, Message],
     
     for i, p_text in enumerate(parts_texts):
         try:
-            reply_seg = None
-            reply_match = _MESSAGE_ID_REPLY_RE.search(p_text)
-            if reply_match:
-                reply_seg = MessageSegment.reply(int(reply_match.group(1)))
-                p_text = _MESSAGE_ID_REPLY_RE.sub("", p_text, count=1).strip()
-
             sub_segments = re.split(r"(\[CQ:image,[^\]]+\])", p_text)
             
             for seg_text in sub_segments:
@@ -297,14 +295,13 @@ async def _send_reply(bot: Bot, event: MessageEvent, reply: Union[str, Message],
                 if not seg_text: continue
                 
                 result = None
-                pending_prefix = Message(reply_seg) if reply_seg else Message()
                 if "[CQ:image" in seg_text:
                     file_match = re.search(r"file=([^,\]]+)", seg_text)
                     if file_match:
                         file_val = file_match.group(1)
-                        result = await nlp_handler.send(pending_prefix + Message(MessageSegment.image(file_val)))
+                        result = await nlp_handler.send(Message(seg_text))
                 else:
-                    result = await nlp_handler.send(pending_prefix + Message(seg_text))
+                    result = await nlp_handler.send(Message(seg_text))
                 
                 # 机器人自己发出的消息也执行同步持久化缓存
                 if result and isinstance(result, dict) and "message_id" in result:

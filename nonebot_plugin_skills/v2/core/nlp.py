@@ -29,9 +29,18 @@ SYSTEM_PROMPT = (
     "【核心回复规则】\n"
     "1. 严禁瞎编！系统在构造上下文时，可能会把历史图片转换成简短的视觉描述；如果你需要对历史图进行修改、重绘或极其精细的细节分析，请务必调用对应的【工具】去获取原图像素。\n"
     "2. 当需要处理图片任务时，优先调用工具。\n"
-    "3. 如需艾特用户，请使用 OneBot v11 CQ 码格式：[CQ:at,qq=目标QQ号]。\n"
-    "4. 你的历史记录带 [ID: xxx] 标记；如果你要引用其中某条消息，请把对应的 [ID: xxx] 放在回复最开头，系统会自动转成真正的引用回复。"
+    "3. 在群聊中如需艾特用户，请使用 OneBot v11 CQ 码格式：[CQ:at,qq=目标QQ号]；在私聊中不要使用@或CQ艾特码。\n"
+    "4. 你的历史记录带 [消息ID: xxx] 标记；如果你要引用其中某条消息，请把对应消息ID写成 [CQ:reply,id=xxx] 并放在回复最开头。"
 )
+
+
+def _build_system_prompt(session_id: str) -> str:
+    if session_id.startswith("private_"):
+        return (
+            f"{SYSTEM_PROMPT}\n"
+            "5. 当前是私聊场景，回复中不要使用@、[CQ:at,...]，直接自然回复即可。"
+        )
+    return SYSTEM_PROMPT
 
 def _get_client() -> Optional[genai.Client]:
     if not config.google_api_key: return None
@@ -217,7 +226,7 @@ async def handle_user_message(bot: Any, event: Any, session_id: str, user_id: st
     history_summary = memory_core.get_history_summary(session_id)
     
     summary_part = f"\n--- 历史对话摘要 ---\n{history_summary}\n" if history_summary else ""
-    system_instruction = f"{SYSTEM_PROMPT}\n--- 记忆 ---\n{context_prompt}{summary_part}"
+    system_instruction = f"{_build_system_prompt(session_id)}\n--- 记忆 ---\n{context_prompt}{summary_part}"
 
     # --- 2. 视觉索引历史构建 ---
     history = memory_core.get_history(session_id)
@@ -227,7 +236,7 @@ async def handle_user_message(bot: Any, event: Any, session_id: str, user_id: st
         text_content = str(m.content or "(空)")
         prefix_parts = []
         if m.message_id:
-            prefix_parts.append(f"[ID: {m.message_id}]")
+            prefix_parts.append(f"[消息ID: {m.message_id}]")
         if getattr(m, "recalled_message_id", None):
             prefix_parts.append(f"[撤回消息ID: {m.recalled_message_id}]")
         prefix = f"{' '.join(prefix_parts)} " if prefix_parts else ""
