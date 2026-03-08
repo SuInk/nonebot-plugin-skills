@@ -40,6 +40,15 @@ _MESSAGE_CACHE = {}
 _CQ_AT_RE = re.compile(r"\[CQ:at,[^\]]+\]")
 _CQ_REPLY_RE = re.compile(r"\[CQ:reply,id=(\d+)\]")
 
+
+def _strip_markdown_syntax(text: str) -> str:
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text, flags=re.S)
+    text = re.sub(r"__(.*?)__", r"\1", text, flags=re.S)
+    text = re.sub(r"~~(.*?)~~", r"\1", text, flags=re.S)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    return text
+
 def _normalize_msg_id(msg_id: Any) -> str:
     try:
         val = int(msg_id)
@@ -151,7 +160,7 @@ async def _cache_message_sync(msg_id: Any, nickname: str, message: Message):
 
 
 def _should_use_forward_reply(event: MessageEvent, full_msg: Message) -> bool:
-    if not isinstance(event, GroupMessageEvent):
+    if not isinstance(event, (GroupMessageEvent, PrivateMessageEvent)):
         return False
     if config.combine_message_threshold <= 0:
         return False
@@ -268,20 +277,87 @@ async def _send_forward_reply(bot: Bot, event: GroupMessageEvent, full_msg: Mess
     message_parts = _split_forward_nodes(full_msg)
     return await _send_forward_message_parts(bot, event, message_parts, cache_message=full_msg)
 
+
+async def _send_private_forward_reply(bot: Bot, event: PrivateMessageEvent, full_msg: Message) -> bool:
+    message_parts = _split_forward_nodes(full_msg)
+    if not message_parts:
+        return False
+
+    attempts = [
+        [
+            MessageSegment.node_custom(
+                user_id=int(bot.self_id),
+                nickname="嘉然",
+                content=message_part,
+            )
+            for message_part in message_parts
+        ],
+        [
+            {
+                "type": "node",
+                "data": {
+                    "user_id": str(bot.self_id),
+                    "nickname": "嘉然",
+                    "content": _message_to_forward_content(message_part),
+                },
+            }
+            for message_part in message_parts
+        ],
+        [
+            {
+                "type": "node",
+                "data": {
+                    "uin": str(bot.self_id),
+                    "name": "嘉然",
+                    "content": _message_to_forward_content(message_part),
+                },
+            }
+            for message_part in message_parts
+        ],
+    ]
+
+    errors = []
+    for idx, nodes in enumerate(attempts, 1):
+        try:
+            result = await bot.call_api(
+                "send_private_forward_msg",
+                user_id=event.user_id,
+                messages=nodes,
+            )
+            if result and isinstance(result, dict) and "message_id" in result:
+                asyncio.create_task(_cache_message_sync(result["message_id"], "嘉然", full_msg))
+            logger.info(f"Private forward send succeeded with strategy #{idx}")
+            return True
+        except Exception as e:
+            errors.append(f"#{idx}: {e}")
+
+    logger.warning(f"Private forward send failed, fallback to normal send: {' | '.join(errors)}")
+    return False
+
 async def _send_reply(bot: Bot, event: MessageEvent, reply: Union[str, Message], force_forward: bool = False):
     if not reply: return
     full_msg = Message(reply) if isinstance(reply, str) else reply
     if isinstance(event, PrivateMessageEvent):
         full_msg = Message(_CQ_AT_RE.sub("", str(full_msg)).strip())
+    full_msg = Message(_strip_markdown_syntax(str(full_msg)))
     if force_forward and isinstance(event, GroupMessageEvent):
         sent = await _send_forward_reply(bot, event, full_msg)
         if sent:
             return
-
-    if not force_forward and _should_use_forward_reply(event, full_msg):
-        sent = await _send_forward_reply(bot, event, full_msg)
+    if force_forward and isinstance(event, PrivateMessageEvent):
+        sent = await _send_private_forward_reply(bot, event, full_msg)
         if sent:
             return
+
+    if not force_forward and _should_use_forward_reply(event, full_msg):
+        if isinstance(event, GroupMessageEvent):
+            sent = await _send_forward_reply(bot, event, full_msg)
+            if sent:
+                return
+        if isinstance(event, PrivateMessageEvent):
+            sent = await _send_private_forward_reply(bot, event, full_msg)
+            if sent:
+                return
 
     msg_str = str(full_msg)
     parts_texts = [p.strip() for p in msg_str.split("<botbr>") if p.strip()]
@@ -301,7 +377,7 @@ async def _send_reply(bot: Bot, event: MessageEvent, reply: Union[str, Message],
                         file_val = file_match.group(1)
                         result = await nlp_handler.send(Message(seg_text))
                 else:
-                    result = await nlp_handler.send(Message(seg_text))
+                    result = await nlp_handler.send(Message(_strip_markdown_syntax(seg_text)))
                 
                 # 机器人自己发出的消息也执行同步持久化缓存
                 if result and isinstance(result, dict) and "message_id" in result:

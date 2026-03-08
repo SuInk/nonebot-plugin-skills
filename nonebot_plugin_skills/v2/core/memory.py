@@ -153,7 +153,7 @@ class MemoryCore:
         # 增加对历史记录中消息 ID 的提示
         history = self.get_history(session_id)
         if any(m.message_id for m in history):
-            prompt += "\n(你可以通过历史记录中的 [消息ID: xxx] 来识别消息；如果要引用某条消息，请把对应的消息ID写成 [CQ:reply,id=xxx] 并放在回复最开头。)"
+            prompt += "\n(你可以通过历史记录中的 [消息ID: xxx] 来识别消息；只有在确实需要引用某条消息时，才把对应的消息ID写成 [CQ:reply,id=xxx] 并放在回复最开头，平时不要每条都引用。)"
             
         return prompt
 
