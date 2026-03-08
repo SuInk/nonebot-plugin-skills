@@ -9,10 +9,10 @@ class Config(BaseModel):
     google_api_key: str = ""
     
     # 基础对话模型 (使用 2.0 Flash 保证极速对话)
-    gemini_text_model: str = "gemini-2.0-flash"
+    gemini_text_model: str = "gemini-3-flash-preview"
     
     # 统一视觉/生图模型 (集生成与修改于一体)
-    gemini_image_model: str = "gemini-3.1-flash-image-preview"
+    gemini_image_model: str = "gemini-3-flash-preview"
     
     # --- 基础运行配置 ---
     request_timeout: float = 30.0

@@ -1,9 +1,8 @@
-import asyncio
 import re
 import base64
-import io
 import hashlib
-from typing import List, Optional, Any, Tuple, Dict, Union
+from typing import Optional, Any, Dict, Union, List
+from pathlib import Path
 from nonebot import logger
 from google import genai
 from google.genai import types
@@ -13,7 +12,11 @@ from nonebot_plugin_skills.v2.core.skills import skill_manager
 from nonebot_plugin_skills.v2.core.memory import memory_core
 from nonebot_plugin_skills.v2.core.context import SkillContext
 from nonebot_plugin_skills.v2.core.http import get_http_client
-from nonebot_plugin_skills.v2.core.utils import build_image_segment
+from nonebot_plugin_skills.v2.core.utils import (
+    build_image_segment,
+    extract_image_sources,
+    local_path_from_file_uri,
+)
 
 from nonebot_plugin_skills.config import config
 
@@ -24,10 +27,10 @@ _IMAGE_DESCRIPTION_CACHE: Dict[str, str] = {}
 SYSTEM_PROMPT = (
     "你是嘉然(Diana)，A-SOUL成员。性格温柔、体贴、元气满满。\n"
     "【核心回复规则】\n"
-    "1. 严禁瞎编！历史记录中包含图片描述。如果你需要对历史图进行修改、重绘或极其精细的细节分析，请务必调用对应的【工具】去获取原图像素。\n"
+    "1. 严禁瞎编！系统在构造上下文时，可能会把历史图片转换成简短的视觉描述；如果你需要对历史图进行修改、重绘或极其精细的细节分析，请务必调用对应的【工具】去获取原图像素。\n"
     "2. 当需要处理图片任务时，优先调用工具。\n"
-    "3. 你具有艾特(@)他人的能力：[CQ:at,qq={user_id}]。\n"
-    "4. 你的历史记录带 [ID: xxx] 标记；如果你要引用其中某条消息，直接输出对应的 [ID: xxx]，系统会自动转成真正的引用回复。"
+    "3. 如需艾特用户，请使用 OneBot v11 CQ 码格式：[CQ:at,qq=目标QQ号]。\n"
+    "4. 你的历史记录带 [ID: xxx] 标记；如果你要引用其中某条消息，请把对应的 [ID: xxx] 放在回复最开头，系统会自动转成真正的引用回复。"
 )
 
 def _get_client() -> Optional[genai.Client]:
@@ -41,6 +44,77 @@ async def _get_image_data(url: str) -> Optional[bytes]:
         resp.raise_for_status()
         return resp.content
     except: return None
+
+
+async def _load_image_bytes(source: str) -> Optional[bytes]:
+    if source.startswith("base64://"):
+        try:
+            return base64.b64decode(source.replace("base64://", "", 1))
+        except Exception:
+            return None
+
+    if source.startswith("file://"):
+        path = local_path_from_file_uri(source)
+        if path and path.exists():
+            try:
+                return path.read_bytes()
+            except Exception:
+                return None
+        return None
+
+    if Path(source).exists():
+        try:
+            return Path(source).read_bytes()
+        except Exception:
+            return None
+
+    return await _get_image_data(source)
+
+
+async def _render_history_text_with_image_descriptions(content: str) -> tuple[str, Dict[str, bytes]]:
+    descriptions: Dict[str, str] = {}
+    raw_images: Dict[str, bytes] = {}
+
+    for source in extract_image_sources(content):
+        if source in descriptions:
+            continue
+        img_data = await _load_image_bytes(source)
+        if not img_data:
+            continue
+        raw_images[source] = img_data
+        descriptions[source] = await _get_image_description(img_data)
+
+    rendered_parts = []
+    for seg in Message(content):
+        if seg.type == "image":
+            source = seg.data.get("file") or seg.data.get("url")
+            rendered_parts.append(descriptions.get(source or "", "[图片]"))
+        elif seg.type == "text":
+            rendered_parts.append(seg.data.get("text", ""))
+        else:
+            rendered_parts.append(str(seg))
+
+    return "".join(rendered_parts).strip(), raw_images
+
+
+async def _describe_image_result(result: Union[str, bytes, MessageSegment]) -> str:
+    if isinstance(result, bytes):
+        return await _get_image_description(result)
+
+    if isinstance(result, MessageSegment):
+        source = result.data.get("file") or result.data.get("url")
+        if source:
+            img_data = await _load_image_bytes(source)
+            if img_data:
+                return await _get_image_description(img_data)
+        return "[图片]"
+
+    for source in extract_image_sources(str(result)):
+        img_data = await _load_image_bytes(source)
+        if img_data:
+            return await _get_image_description(img_data)
+
+    return "[图片]"
 
 async def _get_image_description(image_data: bytes) -> str:
     """获取图片的视觉索引描述 (带缓存)"""
@@ -82,6 +156,39 @@ def _clean_text_for_memory(msg: Union[str, Message]) -> str:
     if isinstance(msg, Message): return msg.extract_plain_text().strip()
     return re.sub(r"\[CQ:image,[^\]]+\]", "", str(msg)).strip()
 
+async def _summarize_history(session_id: str, history: List[Any]) -> str:
+    """对当前历史记录进行摘要压缩"""
+    client = _get_client()
+    if not client: return ""
+    
+    formatted_history = []
+    for m in history:
+        content = str(m.content or "")
+        # 简单过滤，不重复生成图片描述以节省 token
+        content = re.sub(r"\[视觉记忆: [^\]]+\]", "[图片]", content)
+        formatted_history.append(f"{m.role}: {content}")
+    
+    history_text = "\n".join(formatted_history)
+    old_summary = memory_core.get_history_summary(session_id) or "暂无旧摘要"
+    
+    prompt = (
+        f"请根据以下历史对话记录和旧的摘要，生成一段简洁的【对话摘要】。\n"
+        f"要求：保留重要的事实、用户的偏好、以及对话的当前进度。字数控制在 500 字以内。\n\n"
+        f"【旧摘要】: {old_summary}\n\n"
+        f"【最新对话记录】:\n{history_text}\n\n"
+        f"请直接输出新的摘要内容："
+    )
+    
+    try:
+        resp = await client.aio.models.generate_content(
+            model=config.gemini_text_model,
+            contents=prompt
+        )
+        return resp.text.strip() if resp.text else ""
+    except Exception as e:
+        logger.error(f"摘要生成失败: {e}")
+        return ""
+
 async def handle_user_message(bot: Any, event: Any, session_id: str, user_id: str, text: str, already_added: bool = False):
     from nonebot_plugin_skills import _send_reply
     client = _get_client()
@@ -107,8 +214,10 @@ async def handle_user_message(bot: Any, event: Any, session_id: str, user_id: st
 
     active_model = config.gemini_image_model if current_image_parts else config.gemini_text_model
     context_prompt = memory_core.get_context_prompt(session_id, user_id)
-    sys_prompt = SYSTEM_PROMPT.replace('{user_id}', str(user_id))
-    system_instruction = f"{sys_prompt}\n--- 记忆 ---\n{context_prompt}"
+    history_summary = memory_core.get_history_summary(session_id)
+    
+    summary_part = f"\n--- 历史对话摘要 ---\n{history_summary}\n" if history_summary else ""
+    system_instruction = f"{SYSTEM_PROMPT}\n--- 记忆 ---\n{context_prompt}{summary_part}"
 
     # --- 2. 视觉索引历史构建 ---
     history = memory_core.get_history(session_id)
@@ -116,30 +225,22 @@ async def handle_user_message(bot: Any, event: Any, session_id: str, user_id: st
     
     for i, m in enumerate(history):
         text_content = str(m.content or "(空)")
-        prefix = f"[ID: {m.message_id}] " if m.message_id else ""
-        
-        # 识别历史中的图片并转换为描述
-        img_matches = re.findall(r"\[CQ:image,file=([^,\]]+)\]", text_content)
-        for file_val in img_matches:
-            img_data = None
-            if file_val.startswith("base64://"):
-                try: img_data = base64.b64decode(file_val.replace("base64://", ""))
-                except: pass
-            else: img_data = await _get_image_data(file_val)
-            
-            if img_data:
-                # 核心逻辑：普通历史记录只传【文字描述】节省 Token
-                desc = await _get_image_description(img_data)
-                text_content = text_content.replace(f"[CQ:image,file={file_val}]", desc)
-        
+        prefix_parts = []
+        if m.message_id:
+            prefix_parts.append(f"[ID: {m.message_id}]")
+        if getattr(m, "recalled_message_id", None):
+            prefix_parts.append(f"[撤回消息ID: {m.recalled_message_id}]")
+        prefix = f"{' '.join(prefix_parts)} " if prefix_parts else ""
+
+        text_content, history_images = await _render_history_text_with_image_descriptions(text_content)
         parts = [types.Part.from_text(text=f"{prefix}{text_content[:1000]}")]
-        
+
         # 只有在【当前新图】或【被引用消息的原图】时，才注入原始像素
         if i == len(history) - 1 and m.role == "user" and current_image_parts:
             parts.extend(current_image_parts)
         elif quoted_id and m.message_id == quoted_id:
-            for file_val in img_matches[:1]:
-                img_data = await _get_image_data(file_val) if not file_val.startswith("base64://") else base64.b64decode(file_val.replace("base64://", ""))
+            for file_val in extract_image_sources(m.content)[:1]:
+                img_data = history_images.get(file_val) or await _load_image_bytes(file_val)
                 if img_data:
                     parts.append(types.Part.from_bytes(data=img_data, mime_type="image/jpeg"))
                     active_model = config.gemini_image_model
@@ -150,7 +251,36 @@ async def handle_user_message(bot: Any, event: Any, session_id: str, user_id: st
         contents.append(types.Content(role="user", parts=[types.Part.from_text(text=str(input_text))] + current_image_parts))
 
     tools = skill_manager.get_llm_tools()
+    count_config = types.CountTokensConfig(
+        system_instruction=system_instruction,
+        tools=tools,
+    )
     config_obj = types.GenerateContentConfig(system_instruction=system_instruction, tools=tools, temperature=config.chat_style_temperature)
+
+    # --- 3. 主动 Token 检查与预防性压缩 ---
+    try:
+        # 预估当前上下文 Token 数
+        token_count_resp = await client.aio.models.count_tokens(
+            model=active_model,
+            contents=contents,
+            config=count_config,
+        )
+        current_tokens = token_count_resp.total_tokens
+        
+        # 设定主动压缩阈值 (例如 30,000 tokens，对于 Flash 模型这已经包含相当多历史了)
+        # 您可以根据需求调整这个值，或者从 config 中读取
+        PREACTIVE_COMPRESSION_THRESHOLD = 30000
+        
+        if current_tokens > PREACTIVE_COMPRESSION_THRESHOLD:
+            logger.info(f"Session {session_id} tokens ({current_tokens}) exceed threshold. Proactively compressing...")
+            new_summary = await _summarize_history(session_id, history)
+            if new_summary:
+                memory_core.set_history_summary(session_id, new_summary)
+                memory_core.clear_history(session_id)
+                # 递归调用一次以使用新摘要重新构造 contents (只会触发一次，因为 clear 后 tokens 必降)
+                return await handle_user_message(bot, event, session_id, user_id, text, already_added=True)
+    except Exception as token_e:
+        logger.warning(f"Failed to count tokens: {token_e}")
 
     try:
         response = await client.aio.models.generate_content(model=active_model, contents=contents, config=config_obj)
@@ -174,7 +304,7 @@ async def handle_user_message(bot: Any, event: Any, session_id: str, user_id: st
                     if img_seg:
                         await _send_reply(bot, event, Message(img_seg))
                         full_reply.append(img_seg)
-                    clean_res = "[系统：图已发出]"
+                    clean_res = await _describe_image_result(skill_result)
                 else: clean_res = str(skill_result)
                 
                 contents.append(types.Content(role="model", parts=[types.Part.from_function_call(name=skill_name, args=skill_args)]))
@@ -188,8 +318,22 @@ async def handle_user_message(bot: Any, event: Any, session_id: str, user_id: st
         memory_core.add_message(session_id, "model", str(full_reply))
     except Exception as e:
         if "token count exceeds" in str(e):
+            logger.warning(f"Session {session_id} token count exceeded. Compressing history...")
+            
+            # 1. 生成摘要
+            new_summary = await _summarize_history(session_id, history)
+            if new_summary:
+                memory_core.set_history_summary(session_id, new_summary)
+            
+            # 2. 清空历史记录 (摘要已存入 memory_core)
             memory_core.clear_history(session_id)
-            await _send_reply(bot, event, Message("嘉然脑袋过载了呜呜... 记忆已清空，咱们重新聊吧~"))
+            
+            # 3. 自动重试一次 (使用新摘要)
+            try:
+                await handle_user_message(bot, event, session_id, user_id, text, already_added=True)
+            except Exception as retry_e:
+                logger.error(f"Retry after compression failed: {retry_e}")
+                await _send_reply(bot, event, Message("嘉然记忆压缩失败了... 咱们清空记忆重新开始吧~"))
         else:
             logger.error(f"NLP 处理错误: {e}")
             await _send_reply(bot, event, Message(f"嘉然刚才遇到了一点小状况呢... {str(e)}"))

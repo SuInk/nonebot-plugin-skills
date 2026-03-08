@@ -10,6 +10,7 @@ class ChatMessage(BaseModel):
     role: str
     content: str
     message_id: Optional[str] = None # 新增字段
+    recalled_message_id: Optional[str] = None
     timestamp: float = Field(default_factory=time.time)
 
 class UserProfile(BaseModel):
@@ -30,6 +31,7 @@ class MemoryCore:
         self.sessions: Dict[str, List[ChatMessage]] = {}
         self.profiles: Dict[str, UserProfile] = {}
         self.recalls: Dict[str, List[RecalledMessage]] = {}
+        self.history_summaries: Dict[str, str] = {}
         self._load()
 
     def _load(self):
@@ -42,6 +44,7 @@ class MemoryCore:
                     self.sessions[sid] = [ChatMessage(**m) for m in history_data]
                 for sid, recall_data in data.get("recalls", {}).items():
                     self.recalls[sid] = [RecalledMessage(**m) for m in recall_data]
+                self.history_summaries = data.get("history_summaries", {})
                 logger.info(f"Memory loaded with IDs from {self.db_path}")
             except Exception as e:
                 logger.error(f"Error loading memory: {e}")
@@ -53,18 +56,35 @@ class MemoryCore:
                 "profiles": {uid: p.dict() for uid, p in self.profiles.items()},
                 "sessions": {sid: [m.dict() for m in history] for sid, history in self.sessions.items()},
                 "recalls": {sid: [m.dict() for m in recalls] for sid, recalls in self.recalls.items()},
+                "history_summaries": self.history_summaries,
             }
             self.db_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
         except Exception as e:
             logger.error(f"Error saving memory: {e}")
 
-    def add_message(self, session_id: str, role: str, content: Any, message_id: Optional[Any] = None, max_history: int = 20):
+    def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: Any,
+        message_id: Optional[Any] = None,
+        max_history: int = 60,
+        recalled_message_id: Optional[Any] = None,
+    ):
         if session_id not in self.sessions:
             self.sessions[session_id] = []
         
         # 强制格式化
         mid = str(message_id) if message_id is not None else None
-        self.sessions[session_id].append(ChatMessage(role=role, content=str(content), message_id=mid))
+        rid = str(recalled_message_id) if recalled_message_id is not None else None
+        self.sessions[session_id].append(
+            ChatMessage(
+                role=role,
+                content=str(content),
+                message_id=mid,
+                recalled_message_id=rid,
+            )
+        )
         
         if len(self.sessions[session_id]) > max_history:
             self.sessions[session_id] = self.sessions[session_id][-max_history:]
@@ -76,6 +96,13 @@ class MemoryCore:
 
     def get_history(self, session_id: str) -> List[ChatMessage]:
         return self.sessions.get(session_id, [])
+
+    def set_history_summary(self, session_id: str, summary: str):
+        self.history_summaries[session_id] = summary
+        self._save()
+
+    def get_history_summary(self, session_id: str) -> Optional[str]:
+        return self.history_summaries.get(session_id)
 
     def get_profile(self, user_id: str, username: str = "Unknown") -> UserProfile:
         if user_id not in self.profiles:
@@ -98,7 +125,7 @@ class MemoryCore:
             self.sessions[session_id] = []
             self._save()
 
-    def add_recall(self, session_id: str, recall: RecalledMessage, max_recalls: int = 20):
+    def add_recall(self, session_id: str, recall: RecalledMessage, max_recalls: int = 100):
         if session_id not in self.recalls:
             self.recalls[session_id] = []
         self.recalls[session_id].append(recall)
@@ -116,11 +143,17 @@ class MemoryCore:
             prompt += f"关于用户 {profile.username} 的已知记忆:\n"
             for i, fact in enumerate(profile.facts[-10:]):
                 prompt += f"{i+1}. {fact}\n"
+
+        recalls = self.get_recalls(session_id)
+        if recalls:
+            prompt += "\n最近的撤回记录:\n"
+            for i, recall in enumerate(recalls[-5:], 1):
+                prompt += f"{i}. {recall.nickname}({recall.user_id}): {recall.text[:200]}\n"
         
         # 增加对历史记录中 ID 的提示
         history = self.get_history(session_id)
         if any(m.message_id for m in history):
-            prompt += "\n(你可以通过历史记录中的 [ID: xxx] 来识别消息；如果要引用某条消息，直接输出对应的 [ID: xxx] 即可。)"
+            prompt += "\n(你可以通过历史记录中的 [ID: xxx] 来识别消息；如果要引用某条消息，请把对应的 [ID: xxx] 放在回复最开头，系统会自动处理。)"
             
         return prompt
 

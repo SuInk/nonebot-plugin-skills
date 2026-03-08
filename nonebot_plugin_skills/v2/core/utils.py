@@ -1,7 +1,8 @@
 import base64
 import uuid
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Union
+from urllib.parse import unquote, urlparse
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Message, MessageSegment
@@ -29,6 +30,32 @@ def _decode_base64_payload(payload: str) -> Optional[bytes]:
     except Exception as e:
         logger.error(f"Failed to decode base64 image payload: {e}")
         return None
+
+
+def extract_image_sources(message: Union[str, Message]) -> List[str]:
+    parsed = message if isinstance(message, Message) else Message(str(message))
+    sources: List[str] = []
+    for seg in parsed:
+        if seg.type != "image":
+            continue
+        file_val = seg.data.get("file") or seg.data.get("url")
+        if file_val:
+            sources.append(file_val)
+    return sources
+
+
+def local_path_from_file_uri(uri: str) -> Optional[Path]:
+    if not uri.startswith("file://"):
+        return None
+
+    parsed = urlparse(uri)
+    path = unquote(parsed.path or "")
+    if not path:
+        return None
+
+    if len(path) >= 3 and path[0] == "/" and path[2] == ":":
+        path = path[1:]
+    return Path(path)
 
 
 async def build_image_segment(result: Union[str, bytes, MessageSegment]) -> Optional[MessageSegment]:

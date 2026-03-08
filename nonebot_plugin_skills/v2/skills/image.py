@@ -1,17 +1,13 @@
-import asyncio
-from typing import Optional, List, Union, Tuple
+from typing import Optional, Union, Tuple
 from google import genai
 from google.genai import types
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Message
-import re
-import random
-import base64
 
 from nonebot_plugin_skills.v2.core.skills import skill_manager
 from nonebot_plugin_skills.v2.core.context import SkillContext
 from nonebot_plugin_skills.v2.core.http import get_http_client
-from nonebot_plugin_skills.v2.core.utils import build_image_segment
+from nonebot_plugin_skills.v2.core.utils import extract_image_sources
 from nonebot_plugin_skills.config import config
 
 image_schema = {
@@ -80,15 +76,9 @@ async def _find_relevant_image(context: SkillContext, is_group: bool = False, ta
     from nonebot_plugin_skills.v2.core.memory import memory_core
     history = memory_core.get_history(context.session_id)
     for m in reversed(history[-20:]):
-        match = re.search(r"\[CQ:image,file=([^,\]]+)\]", m.content)
-        if match:
-            file_val = match.group(1)
-            from nonebot_plugin_skills.v2.core.nlp import _get_image_data
-            data = None
-            if file_val.startswith("base64://"):
-                try: data = base64.b64decode(file_val.replace("base64://", ""))
-                except: pass
-            else: data = await _get_image_data(file_val)
+        for file_val in extract_image_sources(m.content)[:1]:
+            from nonebot_plugin_skills.v2.core.nlp import _load_image_bytes
+            data = await _load_image_bytes(file_val)
             if data: return data, "刚才看到的那张图片"
 
     # 4. 头像
